@@ -20,9 +20,9 @@ const SELECTED_TEXT_COLOR: Color = Color::Indexed(0);
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let columns = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(3, 8),
-        Constraint::Ratio(3, 8),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
     ])
     .spacing(1);
 
@@ -30,13 +30,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let has_ci_runs = app.project_ci_runs().is_some();
 
-    if has_ci_runs {
-        let left_chunks =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(left);
-        render_metadata(frame, app, left_chunks[0]);
-        render_ci_runs(frame, app, left_chunks[1]);
-    } else {
-        render_metadata(frame, app, left);
+    let has_languages = app.project_languages().is_some();
+
+    match (has_ci_runs, has_languages) {
+        (true, true) => {
+            let left_chunks = Layout::vertical([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(left);
+            render_metadata(frame, app, left_chunks[0]);
+            render_languages(frame, app, left_chunks[1]);
+            render_ci_runs(frame, app, left_chunks[2]);
+        }
+        (true, false) => {
+            let left_chunks =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(left);
+            render_metadata(frame, app, left_chunks[0]);
+            render_ci_runs(frame, app, left_chunks[1]);
+        }
+        (false, true) => {
+            let left_chunks =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(left);
+            render_metadata(frame, app, left_chunks[0]);
+            render_languages(frame, app, left_chunks[1]);
+        }
+        (false, false) => render_metadata(frame, app, left),
     }
 
     let show_project_search =
@@ -88,27 +110,26 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|project| project.path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let secondary_style = Style::default().fg(INACTIVE_TEXT_COLOR);
-        let mut body = vec![
+        let body = vec![
             Line::from(Span::styled(path, secondary_style)),
             Line::default(),
             Line::from(Span::styled(metadata.description.clone(), secondary_style)),
         ];
 
-        if let Some(languages) = app.project_languages() {
-            body.push(Line::default());
-            body.push(language_summary_header_line());
-            for language in languages.languages.iter().take(6) {
-                body.push(language_summary_line(language));
-            }
-            body.push(Line::default());
-        }
-
         (
             format!(
-                "{} @{}  {} {}",
+                "{}{}{} {}",
                 metadata.package_name,
-                metadata.package_version,
-                metadata.git_branch,
+                if metadata.package_version == "—" {
+                    String::new()
+                } else {
+                    format!(" @{}", metadata.package_version)
+                },
+                if metadata.git_branch == "—" {
+                    String::new()
+                } else {
+                    format!("  {}", metadata.git_branch)
+                },
                 metadata.git_status
             ),
             body,
@@ -126,13 +147,16 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: Rect) {
             .block(
                 Block::bordered()
                     .title(
-                        Line::from(title)
-                            .style(Style::default().fg(ACTIVE_TEXT_COLOR).add_modifier(Modifier::BOLD)),
+                        Line::from(title).style(
+                            Style::default()
+                                .fg(ACTIVE_TEXT_COLOR)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     )
-                    .title_alignment(Alignment::Left)
+                    .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::Green),
+            .fg(INACTIVE_COLOR),
         area,
     );
 }
@@ -484,43 +508,63 @@ fn format_duration(duration: Option<std::time::Duration>) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
-const LANGUAGE_SUMMARY_LABEL_WIDTH: usize = 32;
+fn render_languages(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(languages) = app.project_languages() else {
+        return;
+    };
 
-fn language_summary_header_line() -> Line<'static> {
-    let header_style = Style::default()
-        .fg(ACTIVE_TEXT_COLOR)
-        .add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::raw(" ".repeat(LANGUAGE_SUMMARY_LABEL_WIDTH + 3)),
-        Span::styled(
-            format!("{:>6}  {:>8}  {:>6}", "code", "comments", "blank"),
-            header_style,
-        ),
-    ])
-}
+    let rows: Vec<Row> = languages
+        .languages
+        .iter()
+        .take(area.height.saturating_sub(3) as usize)
+        .map(|language| {
+            Row::new(vec![
+                Cell::from(language_label_text(&language.name)).style(
+                    Style::default()
+                        .fg(ACTIVE_TEXT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(format_count(language.code)),
+                Cell::from(format_count(language.comments)),
+                Cell::from(format_count(language.blanks)),
+            ])
+            .style(Style::default().fg(INACTIVE_TEXT_COLOR))
+        })
+        .collect();
 
-fn language_summary_line(language: &crate::app::LanguageStat) -> Line<'static> {
-    let name_style = Style::default().fg(ACTIVE_TEXT_COLOR).add_modifier(Modifier::BOLD);
-    let secondary_style = Style::default().fg(INACTIVE_TEXT_COLOR);
-    let code = format_count(language.code);
-    let comments = format_count(language.comments);
-    let blanks = format_count(language.blanks);
-    let label = language_label_text(&language.name);
-    let label_width = label.width();
-    let label_padding = " ".repeat(LANGUAGE_SUMMARY_LABEL_WIDTH.saturating_sub(label_width));
-    Line::from(vec![
-        Span::styled(format!("  {label}{label_padding} "), name_style),
-        Span::styled(
-            format!("{:>6}  {:>8}  {:>6}", code, comments, blanks),
-            secondary_style,
-        ),
-    ])
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(8),
+                Constraint::Length(6),
+            ],
+        )
+        .header(
+            Row::new(vec!["Language", "Code", "Comments", "Blank"]).style(
+                Style::default()
+                    .fg(ACTIVE_TEXT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .column_spacing(1)
+        .block(
+            Block::bordered()
+                .title("Languages")
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Rounded),
+        )
+        .fg(INACTIVE_COLOR),
+        area,
+    );
 }
 
 fn render_ci_runs(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(ci) = app.project_ci_runs() else {
+    if app.project_ci_runs().is_none() {
         return;
-    };
+    }
 
     let inner = area.inner(Margin {
         vertical: 1,
@@ -529,9 +573,8 @@ fn render_ci_runs(frame: &mut Frame, app: &App, area: Rect) {
     let visible_rows = inner.height.saturating_sub(1) as usize;
     let scroll_offset = ci_scroll_offset(app, visible_rows);
 
-    let rows: Vec<Row> = ci
-        .runs
-        .iter()
+    let rows: Vec<Row> = app
+        .visible_ci_runs()
         .enumerate()
         .skip(scroll_offset)
         .take(visible_rows)
@@ -545,11 +588,11 @@ fn render_ci_runs(frame: &mut Frame, app: &App, area: Rect) {
                 Constraint::Length(3),
                 Constraint::Length(10),
                 Constraint::Fill(1),
-                Constraint::Length(11),
+                Constraint::Length(16),
             ],
         )
         .header(
-            Row::new(vec!["", "Branch", "Commit", "When"])
+            Row::new(vec!["", "Branch", "Commit", "Timestamp"])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .block(
@@ -566,7 +609,8 @@ fn render_ci_runs(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    let mut scrollbar_state = ScrollbarState::new(ci.runs.len()).position(scroll_offset);
+    let mut scrollbar_state =
+        ScrollbarState::new(app.filtered_ci_runs.len()).position(scroll_offset);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight),
         area.inner(Margin {
@@ -585,7 +629,11 @@ fn ci_run_row(app: &App, index: usize, run: &CiRun) -> Row<'static> {
             .bg(ACTIVE_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(INACTIVE_TEXT_COLOR)
+        Style::default().fg(if app.focus == Focus::CiRuns {
+            ACTIVE_TEXT_COLOR
+        } else {
+            INACTIVE_TEXT_COLOR
+        })
     };
     let status = match run.status.as_str() {
         "success" => Span::styled("✓", row_style.fg(Color::Green)),
@@ -680,17 +728,18 @@ fn truncate(value: &str, max: usize) -> String {
         + "…"
 }
 
-
 fn format_ci_time(value: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|_| value.to_string())
 }
 
 fn ci_scroll_offset(app: &App, visible_rows: usize) -> usize {
-    app.project_ci_runs()
-        .map(|ci| scroll_offset(ci.runs.len(), app.ci_cursor, visible_rows))
-        .unwrap_or(0)
+    scroll_offset(app.filtered_ci_runs.len(), app.ci_cursor, visible_rows)
 }
 
 fn project_scroll_offset(app: &App, visible_rows: usize) -> usize {

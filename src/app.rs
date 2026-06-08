@@ -159,10 +159,13 @@ pub struct App {
     pub focus: Focus,
     pub filter_mode: bool,
     pub project_query: String,
+    pub ci_query: String,
     pub target_query: String,
     pub project_input: Input,
+    pub ci_input: Input,
     pub target_input: Input,
     pub filtered_projects: Vec<usize>,
+    pub filtered_ci_runs: Vec<usize>,
     pub filtered_targets: Vec<usize>,
     pub project_matcher: Nucleo<Project>,
     pub target_matcher: Nucleo<Target>,
@@ -215,10 +218,13 @@ impl Default for App {
             focus: Focus::Projects,
             filter_mode: false,
             project_query: String::new(),
+            ci_query: String::new(),
             target_query: String::new(),
             project_input: Input::default(),
+            ci_input: Input::default(),
             target_input: Input::default(),
             filtered_projects: Vec::new(),
+            filtered_ci_runs: Vec::new(),
             filtered_targets: Vec::new(),
             project_matcher: new_matcher(),
             target_matcher: new_matcher(),
@@ -300,9 +306,16 @@ impl App {
             .filter(|ci| !ci.runs.is_empty())
     }
 
+    pub fn visible_ci_runs(&self) -> impl Iterator<Item = &CiRun> {
+        self.filtered_ci_runs
+            .iter()
+            .filter_map(|&index| self.project_ci_runs()?.runs.get(index))
+    }
+
     pub fn current_ci_run(&self) -> Option<&CiRun> {
-        let index = usize::try_from(self.ci_cursor).ok()?;
-        self.project_ci_runs()?.runs.get(index)
+        let visible_index = usize::try_from(self.ci_cursor).ok()?;
+        let ci_index = *self.filtered_ci_runs.get(visible_index)?;
+        self.project_ci_runs()?.runs.get(ci_index)
     }
 
     pub fn project_languages(&self) -> Option<&LanguagesData> {
@@ -385,33 +398,26 @@ impl App {
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
-            KeyCode::Char('/') => {
-                self.filter_mode = true;
-                match self.focus {
-                    Focus::Projects => {
-                        self.cursor = if self.filtered_projects.is_empty() {
-                            -1
-                        } else {
-                            0
-                        };
-                        self.refresh_targets();
-                    }
-                    Focus::CiRuns => {
-                        self.ci_cursor = if self.project_ci_runs().is_some() {
-                            0
-                        } else {
-                            -1
-                        };
-                    }
-                    Focus::Targets => {
-                        self.target_cursor = if self.filtered_targets.is_empty() {
-                            -1
-                        } else {
-                            0
-                        };
-                    }
+            KeyCode::Char('/') => match self.focus {
+                Focus::Projects => {
+                    self.filter_mode = true;
+                    self.cursor = if self.filtered_projects.is_empty() {
+                        -1
+                    } else {
+                        0
+                    };
+                    self.refresh_targets();
                 }
-            }
+                Focus::CiRuns => {}
+                Focus::Targets => {
+                    self.filter_mode = true;
+                    self.target_cursor = if self.filtered_targets.is_empty() {
+                        -1
+                    } else {
+                        0
+                    };
+                }
+            },
             KeyCode::Right | KeyCode::Char('l') => {
                 self.focus = match self.focus {
                     Focus::Projects => Focus::Targets,
@@ -420,15 +426,17 @@ impl App {
                 };
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.focus =
-                    if matches!(self.focus, Focus::Projects) && self.project_ci_runs().is_some() {
+                self.focus = match self.focus {
+                    Focus::Projects if self.project_ci_runs().is_some() => {
                         if self.ci_cursor < 0 {
                             self.ci_cursor = 0;
                         }
                         Focus::CiRuns
-                    } else {
-                        Focus::Projects
-                    };
+                    }
+                    Focus::Projects => Focus::Projects,
+                    Focus::CiRuns => Focus::CiRuns,
+                    Focus::Targets => Focus::Projects,
+                };
             }
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Projects => self.select_next_project(),
@@ -513,10 +521,10 @@ impl App {
                 self.refresh_targets();
             }
             Focus::CiRuns => {
-                self.ci_cursor = if self.project_ci_runs().is_some() {
-                    0
-                } else {
+                self.ci_cursor = if self.filtered_ci_runs.is_empty() {
                     -1
+                } else {
+                    0
                 };
             }
             Focus::Targets => {
@@ -540,10 +548,11 @@ impl App {
                 self.refresh_targets();
             }
             Focus::CiRuns => {
-                self.ci_cursor = self
-                    .project_ci_runs()
-                    .map(|ci| ci.runs.len() as isize - 1)
-                    .unwrap_or(-1);
+                self.ci_cursor = if self.filtered_ci_runs.is_empty() {
+                    -1
+                } else {
+                    self.filtered_ci_runs.len() as isize - 1
+                };
             }
             Focus::Targets => {
                 self.target_cursor = if self.filtered_targets.is_empty() {
@@ -569,15 +578,15 @@ impl App {
     }
 
     pub fn select_next_ci_run(&mut self) {
-        let Some(ci) = self.project_ci_runs() else {
+        if self.filtered_ci_runs.is_empty() {
             self.ci_cursor = -1;
             return;
-        };
+        }
 
         self.ci_cursor = if self.ci_cursor < 0 {
             0
         } else {
-            (self.ci_cursor + 1) % ci.runs.len() as isize
+            (self.ci_cursor + 1) % self.filtered_ci_runs.len() as isize
         };
     }
 
@@ -594,15 +603,15 @@ impl App {
     }
 
     pub fn select_previous_ci_run(&mut self) {
-        let Some(ci) = self.project_ci_runs() else {
+        if self.filtered_ci_runs.is_empty() {
             self.ci_cursor = -1;
             return;
-        };
+        }
 
         self.ci_cursor = if self.ci_cursor < 0 {
-            ci.runs.len() as isize - 1
+            self.filtered_ci_runs.len() as isize - 1
         } else {
-            (self.ci_cursor - 1).rem_euclid(ci.runs.len() as isize)
+            (self.ci_cursor - 1).rem_euclid(self.filtered_ci_runs.len() as isize)
         };
     }
 
@@ -775,9 +784,8 @@ impl App {
                         .is_some_and(|project| project.path == path);
                     self.loading_ci_runs.remove(&path);
                     self.ci_runs_cache.insert(path, ci_runs);
-                    if is_current_project && self.project_ci_runs().is_some() && self.ci_cursor < 0
-                    {
-                        self.ci_cursor = 0;
+                    if is_current_project {
+                        self.update_ci_filter();
                     }
                 }
                 BackgroundResult::Languages(path, languages) => {
@@ -1019,7 +1027,7 @@ impl App {
     fn active_filter_is_non_empty(&self) -> bool {
         match self.focus {
             Focus::Projects => !self.project_query.is_empty(),
-            Focus::CiRuns => false,
+            Focus::CiRuns => !self.ci_query.is_empty(),
             Focus::Targets => !self.target_query.is_empty(),
         }
     }
@@ -1031,7 +1039,11 @@ impl App {
                 self.project_query = self.project_input.value().to_string();
                 self.update_project_filter();
             }
-            Focus::CiRuns => {}
+            Focus::CiRuns => {
+                self.ci_input.handle(request);
+                self.ci_query = self.ci_input.value().to_string();
+                self.update_ci_filter();
+            }
             Focus::Targets => {
                 self.target_input.handle(request);
                 self.target_query = self.target_input.value().to_string();
@@ -1052,10 +1064,10 @@ impl App {
                 self.refresh_targets();
             }
             Focus::CiRuns => {
-                self.ci_cursor = if self.project_ci_runs().is_some() {
-                    0
-                } else {
+                self.ci_cursor = if self.filtered_ci_runs.is_empty() {
                     -1
+                } else {
+                    0
                 };
             }
             Focus::Targets => {
@@ -1083,6 +1095,10 @@ impl App {
             0
         };
 
+        self.ci_input.reset();
+        self.ci_query.clear();
+        self.update_ci_filter();
+
         self.target_input.reset();
         self.target_query.clear();
         self.update_target_filter();
@@ -1091,10 +1107,10 @@ impl App {
         } else {
             0
         };
-        self.ci_cursor = if self.project_ci_runs().is_some() {
-            0
-        } else {
+        self.ci_cursor = if self.filtered_ci_runs.is_empty() {
             -1
+        } else {
+            0
         };
 
         self.refresh_targets();
@@ -1105,6 +1121,7 @@ impl App {
             self.targets.clear();
             self.filtered_targets.clear();
             self.target_cursor = -1;
+            self.filtered_ci_runs.clear();
             self.ci_cursor = -1;
             return;
         };
@@ -1119,11 +1136,7 @@ impl App {
             self.target_cursor = -1;
             self.request_targets(path);
         }
-        self.ci_cursor = if self.project_ci_runs().is_some() {
-            0
-        } else {
-            -1
-        };
+        self.update_ci_filter();
     }
 
     fn refresh_target_status(&mut self) {
@@ -1232,6 +1245,33 @@ impl App {
         );
         let _ = self.project_matcher.tick(10);
         self.sync_filtered_projects();
+    }
+
+    fn update_ci_filter(&mut self) {
+        let query = self.ci_query.to_ascii_lowercase();
+        self.filtered_ci_runs = self
+            .project_ci_runs()
+            .map(|ci| {
+                ci.runs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, run)| {
+                        query.is_empty()
+                            || run.branch.to_ascii_lowercase().contains(&query)
+                            || run.title.to_ascii_lowercase().contains(&query)
+                            || run.status.to_ascii_lowercase().contains(&query)
+                            || run.created_at.to_ascii_lowercase().contains(&query)
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.ci_cursor = if self.filtered_ci_runs.is_empty() {
+            -1
+        } else {
+            self.ci_cursor
+                .clamp(0, self.filtered_ci_runs.len() as isize - 1)
+        };
     }
 
     fn update_target_filter(&mut self) {
