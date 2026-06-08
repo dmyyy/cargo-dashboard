@@ -143,6 +143,7 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(body)
+            .alignment(Alignment::Center)
             .wrap(Wrap { trim: false })
             .block(
                 Block::bordered()
@@ -198,10 +199,6 @@ fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
             .into_iter()
             .map(|(index, project)| {
                 let is_selected = app.cursor == index as isize;
-                let is_dirty_or_untracked = app
-                    .git_status_cache
-                    .get(&project.path)
-                    .is_some_and(|status| matches!(status.as_str(), "DIRTY" | "UNTRACKED"));
                 let base_style = if is_selected {
                     Style::default()
                         .fg(SELECTED_TEXT_COLOR)
@@ -216,10 +213,10 @@ fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let name_style = if is_selected {
                     base_style
-                } else if is_dirty_or_untracked {
-                    base_style.fg(Color::Red)
-                } else {
+                } else if app.focus == Focus::Projects {
                     base_style.fg(ACTIVE_TEXT_COLOR)
+                } else {
+                    base_style.fg(INACTIVE_TEXT_COLOR)
                 };
                 let cached_size = app.cached_project_size_bytes(&project);
                 let size_text = cached_size
@@ -545,7 +542,7 @@ fn render_languages(frame: &mut Frame, app: &App, area: Rect) {
         .header(
             Row::new(vec!["Language", "Code", "Comments", "Blank"]).style(
                 Style::default()
-                    .fg(ACTIVE_TEXT_COLOR)
+                    .fg(ACTIVE_COLOR)
                     .add_modifier(Modifier::BOLD),
             ),
         )
