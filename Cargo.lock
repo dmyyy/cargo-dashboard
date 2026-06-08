@@ -438,6 +438,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tui-input",
+ "unicode-width",
 ]
 
 [[package]]

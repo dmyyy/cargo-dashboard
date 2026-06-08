@@ -1,4 +1,7 @@
-use crate::{event::{AppEvent, Event, EventHandler}, ui};
+use crate::{
+    event::{AppEvent, Event, EventHandler},
+    ui,
+};
 use cargo_metadata::{MetadataCommand, Target as CargoTarget};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nucleo::{
@@ -9,7 +12,6 @@ use ratatui::{
     DefaultTerminal,
     style::{Color, Style},
 };
-use tui_input::{Input, InputRequest};
 use ratatui_cheese::spinner::{Spinner, SpinnerState, SpinnerType};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,12 +22,14 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tui_input::{Input, InputRequest};
 
 #[derive(Debug, Clone)]
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
+    pub has_git_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +42,7 @@ pub struct Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
+    CiRuns,
     Targets,
 }
 
@@ -99,6 +104,37 @@ pub enum BackgroundResult {
     Metadata(PathBuf, ProjectMetadataSummary),
     GitStatus(PathBuf, String),
     Size(PathBuf, u64),
+    CiRuns(PathBuf, Option<CiRunsData>),
+    Languages(PathBuf, Option<LanguagesData>),
+    Targets(PathBuf, Vec<Target>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CiRun {
+    pub status: String,
+    pub branch: String,
+    pub title: String,
+    pub created_at: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunsData {
+    pub repo: String,
+    pub runs: Vec<CiRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageStat {
+    pub name: String,
+    pub code: u64,
+    pub blanks: u64,
+    pub comments: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguagesData {
+    pub languages: Vec<LanguageStat>,
 }
 
 pub struct App {
@@ -106,14 +142,20 @@ pub struct App {
     pub counter: u8,
     pub cursor: isize,
     pub target_cursor: isize,
+    pub ci_cursor: isize,
     pub targets: Vec<Target>,
     pub target_cache: HashMap<PathBuf, Vec<Target>>,
     pub metadata_cache: HashMap<PathBuf, ProjectMetadataSummary>,
+    pub ci_runs_cache: HashMap<PathBuf, Option<CiRunsData>>,
+    pub languages_cache: HashMap<PathBuf, Option<LanguagesData>>,
     pub git_status_cache: HashMap<PathBuf, String>,
     pub size_cache: HashMap<PathBuf, u64>,
     pub loading_metadata: HashSet<PathBuf>,
     pub loading_git_statuses: HashSet<PathBuf>,
     pub loading_sizes: HashSet<PathBuf>,
+    pub loading_ci_runs: HashSet<PathBuf>,
+    pub loading_languages: HashSet<PathBuf>,
+    pub loading_targets: HashSet<PathBuf>,
     pub focus: Focus,
     pub filter_mode: bool,
     pub project_query: String,
@@ -129,12 +171,14 @@ pub struct App {
     pub spinner_state: SpinnerState,
     pub spinner_last_tick: Instant,
     pub git_status_scan_index: usize,
+    pub pending_g: bool,
     pub projects_root: PathBuf,
     pub projects: Vec<Project>,
     pub recent_projects: RecentProjects,
     pub bookmarked_projects: BookmarkedProjects,
     pub background_tx: mpsc::UnboundedSender<BackgroundResult>,
     pub background_rx: mpsc::UnboundedReceiver<BackgroundResult>,
+    pub background_limiter: Arc<Semaphore>,
     pub events: EventHandler,
 }
 
@@ -147,19 +191,27 @@ impl Default for App {
         sort_projects(&mut projects, &recent_projects);
         let (background_tx, background_rx) = mpsc::unbounded_channel();
 
+        let background_limiter = Arc::new(Semaphore::new(8));
+
         let mut app = Self {
             running: true,
             counter: 0,
             cursor: -1,
             target_cursor: -1,
+            ci_cursor: -1,
             targets: Vec::new(),
             target_cache: HashMap::new(),
             metadata_cache: HashMap::new(),
+            ci_runs_cache: HashMap::new(),
+            languages_cache: HashMap::new(),
             git_status_cache: HashMap::new(),
             size_cache: HashMap::new(),
             loading_metadata: HashSet::new(),
             loading_git_statuses: HashSet::new(),
             loading_sizes: HashSet::new(),
+            loading_ci_runs: HashSet::new(),
+            loading_languages: HashSet::new(),
+            loading_targets: HashSet::new(),
             focus: Focus::Projects,
             filter_mode: false,
             project_query: String::new(),
@@ -175,12 +227,14 @@ impl Default for App {
             spinner_state: SpinnerState::new(SpinnerType::Moon),
             spinner_last_tick: Instant::now(),
             git_status_scan_index: 0,
+            pending_g: false,
             projects_root,
             projects,
             recent_projects,
             bookmarked_projects,
             background_tx,
             background_rx,
+            background_limiter,
             events: EventHandler::new(),
         };
 
@@ -226,13 +280,34 @@ impl App {
 
     pub fn running_target_statuses(&self) -> impl Iterator<Item = &TargetStatus> {
         self.target_statuses.iter().filter(|status| {
-            matches!(status.kind, TargetStatusKind::Building | TargetStatusKind::Running)
+            matches!(
+                status.kind,
+                TargetStatusKind::Building | TargetStatusKind::Running
+            )
         })
     }
 
     pub fn project_metadata(&self) -> Option<&ProjectMetadataSummary> {
         let project_path = self.current_project()?.path.clone();
         self.metadata_cache.get(&project_path)
+    }
+
+    pub fn project_ci_runs(&self) -> Option<&CiRunsData> {
+        let project_path = self.current_project()?.path.clone();
+        self.ci_runs_cache
+            .get(&project_path)?
+            .as_ref()
+            .filter(|ci| !ci.runs.is_empty())
+    }
+
+    pub fn current_ci_run(&self) -> Option<&CiRun> {
+        let index = usize::try_from(self.ci_cursor).ok()?;
+        self.project_ci_runs()?.runs.get(index)
+    }
+
+    pub fn project_languages(&self) -> Option<&LanguagesData> {
+        let project_path = self.current_project()?.path.clone();
+        self.languages_cache.get(&project_path)?.as_ref()
     }
 
     pub fn new() -> Self {
@@ -279,14 +354,33 @@ impl App {
             return Ok(());
         }
 
+        if self.pending_g {
+            self.pending_g = false;
+            match key_event.code {
+                KeyCode::Char('g') => {
+                    self.go_to_top();
+                    return Ok(());
+                }
+                KeyCode::Char('e') => {
+                    self.go_to_bottom();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         if key_event.code == KeyCode::Backspace && self.active_filter_is_non_empty() {
             self.handle_filter_backspace();
             return Ok(());
         }
 
         match key_event.code {
-            KeyCode::Esc => self.clear_all_filters(),
+            KeyCode::Esc => {
+                self.pending_g = false;
+                self.clear_all_filters()
+            }
             KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('b') => self.toggle_selected_project_bookmark(),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
@@ -295,25 +389,62 @@ impl App {
                 self.filter_mode = true;
                 match self.focus {
                     Focus::Projects => {
-                        self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+                        self.cursor = if self.filtered_projects.is_empty() {
+                            -1
+                        } else {
+                            0
+                        };
                         self.refresh_targets();
                     }
+                    Focus::CiRuns => {
+                        self.ci_cursor = if self.project_ci_runs().is_some() {
+                            0
+                        } else {
+                            -1
+                        };
+                    }
                     Focus::Targets => {
-                        self.target_cursor = if self.filtered_targets.is_empty() { -1 } else { 0 };
+                        self.target_cursor = if self.filtered_targets.is_empty() {
+                            -1
+                        } else {
+                            0
+                        };
                     }
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Targets,
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Projects,
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.focus = match self.focus {
+                    Focus::Projects => Focus::Targets,
+                    Focus::CiRuns => Focus::Projects,
+                    Focus::Targets => Focus::Targets,
+                };
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focus =
+                    if matches!(self.focus, Focus::Projects) && self.project_ci_runs().is_some() {
+                        if self.ci_cursor < 0 {
+                            self.ci_cursor = 0;
+                        }
+                        Focus::CiRuns
+                    } else {
+                        Focus::Projects
+                    };
+            }
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Projects => self.select_next_project(),
+                Focus::CiRuns => self.select_next_ci_run(),
                 Focus::Targets => self.select_next_target(),
             },
             KeyCode::Char('k') | KeyCode::Up => match self.focus {
                 Focus::Projects => self.select_previous_project(),
+                Focus::CiRuns => self.select_previous_ci_run(),
                 Focus::Targets => self.select_previous_target(),
             },
-            KeyCode::Enter => self.run_selected_target()?,
+            KeyCode::Enter => match self.focus {
+                Focus::Projects => {}
+                Focus::CiRuns => self.open_selected_ci_run()?,
+                Focus::Targets => self.run_selected_target()?,
+            },
             KeyCode::Char('O') => self.open_selected_project()?,
             _ => {}
         }
@@ -342,6 +473,8 @@ impl App {
         self.request_visible_git_statuses();
         self.request_next_git_status_batch(4);
         self.request_current_project_metadata();
+        self.request_current_project_ci_runs();
+        self.request_current_project_languages();
     }
 
     pub fn quit(&mut self) {
@@ -369,6 +502,59 @@ impl App {
         self.refresh_targets();
     }
 
+    pub fn go_to_top(&mut self) {
+        match self.focus {
+            Focus::Projects => {
+                self.cursor = if self.filtered_projects.is_empty() {
+                    -1
+                } else {
+                    0
+                };
+                self.refresh_targets();
+            }
+            Focus::CiRuns => {
+                self.ci_cursor = if self.project_ci_runs().is_some() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            Focus::Targets => {
+                self.target_cursor = if self.filtered_targets.is_empty() {
+                    -1
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
+    pub fn go_to_bottom(&mut self) {
+        match self.focus {
+            Focus::Projects => {
+                self.cursor = if self.filtered_projects.is_empty() {
+                    -1
+                } else {
+                    self.filtered_projects.len() as isize - 1
+                };
+                self.refresh_targets();
+            }
+            Focus::CiRuns => {
+                self.ci_cursor = self
+                    .project_ci_runs()
+                    .map(|ci| ci.runs.len() as isize - 1)
+                    .unwrap_or(-1);
+            }
+            Focus::Targets => {
+                self.target_cursor = if self.filtered_targets.is_empty() {
+                    -1
+                } else {
+                    self.filtered_targets.len() as isize - 1
+                };
+            }
+        }
+    }
+
     pub fn select_previous_project(&mut self) {
         if self.filtered_projects.is_empty() {
             return;
@@ -382,6 +568,19 @@ impl App {
         self.refresh_targets();
     }
 
+    pub fn select_next_ci_run(&mut self) {
+        let Some(ci) = self.project_ci_runs() else {
+            self.ci_cursor = -1;
+            return;
+        };
+
+        self.ci_cursor = if self.ci_cursor < 0 {
+            0
+        } else {
+            (self.ci_cursor + 1) % ci.runs.len() as isize
+        };
+    }
+
     pub fn select_next_target(&mut self) {
         if self.filtered_targets.is_empty() {
             return;
@@ -391,6 +590,19 @@ impl App {
             0
         } else {
             (self.target_cursor + 1) % self.filtered_targets.len() as isize
+        };
+    }
+
+    pub fn select_previous_ci_run(&mut self) {
+        let Some(ci) = self.project_ci_runs() else {
+            self.ci_cursor = -1;
+            return;
+        };
+
+        self.ci_cursor = if self.ci_cursor < 0 {
+            ci.runs.len() as isize - 1
+        } else {
+            (self.ci_cursor - 1).rem_euclid(ci.runs.len() as isize)
         };
     }
 
@@ -406,6 +618,20 @@ impl App {
         };
     }
 
+    pub fn open_selected_ci_run(&mut self) -> color_eyre::Result<()> {
+        let Some(run) = self.current_ci_run() else {
+            return Ok(());
+        };
+
+        Command::new("open")
+            .arg(&run.url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(())
+    }
+
     pub fn open_selected_project(&mut self) -> color_eyre::Result<()> {
         let Some(project) = self.current_project() else {
             return Ok(());
@@ -413,8 +639,8 @@ impl App {
 
         let project_path = project.path.clone();
         let command = format!(
-            "zellij action new-tab && cd {} && env YAZI=false fish -c zellij_open_project",
-            shell_escape_path(&project_path)
+            "zellij action new-tab && (cd {cwd} && env YAZI=false fish -c zellij_open_project) >/dev/null 2>&1 & zellij action go-to-previous-tab >/dev/null 2>&1",
+            cwd = shell_escape_path(&project_path)
         );
 
         Command::new("sh")
@@ -442,7 +668,8 @@ impl App {
         let project_path = project.path.clone();
         let target_name = target.name.clone();
         let target_kind = target.kind.clone();
-        let (status_path, log_path, pid_path) = target_runtime_paths(&project_path, &target_kind, &target_name);
+        let (status_path, log_path, pid_path) =
+            target_runtime_paths(&project_path, &target_kind, &target_name);
         if let Some(parent) = status_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -462,7 +689,7 @@ impl App {
         );
 
         let command = format!(
-            "zellij action new-pane -f --close-on-exit --height 50 --width 180 --cwd {} -- sh -lc {}",
+            "zellij action new-pane -f --close-on-exit --height 40 --width 140 --cwd {} -- sh -lc {}",
             shell_escape_path(&project_path),
             shell_escape_arg(&pane_command),
         );
@@ -510,6 +737,11 @@ impl App {
         self.targets.get(target_index)
     }
 
+    pub fn targets_loading(&self) -> bool {
+        self.current_project()
+            .is_some_and(|project| self.loading_targets.contains(&project.path))
+    }
+
     pub fn visible_projects(&self) -> impl Iterator<Item = &Project> {
         self.filtered_projects
             .iter()
@@ -537,6 +769,32 @@ impl App {
                     self.loading_sizes.remove(&path);
                     self.size_cache.insert(path, size);
                 }
+                BackgroundResult::CiRuns(path, ci_runs) => {
+                    let is_current_project = self
+                        .current_project()
+                        .is_some_and(|project| project.path == path);
+                    self.loading_ci_runs.remove(&path);
+                    self.ci_runs_cache.insert(path, ci_runs);
+                    if is_current_project && self.project_ci_runs().is_some() && self.ci_cursor < 0
+                    {
+                        self.ci_cursor = 0;
+                    }
+                }
+                BackgroundResult::Languages(path, languages) => {
+                    self.loading_languages.remove(&path);
+                    self.languages_cache.insert(path, languages);
+                }
+                BackgroundResult::Targets(path, targets) => {
+                    let is_current_project = self
+                        .current_project()
+                        .is_some_and(|project| project.path == path);
+                    self.loading_targets.remove(&path);
+                    self.target_cache.insert(path, targets.clone());
+                    if is_current_project {
+                        self.targets = targets;
+                        self.rebuild_target_matcher();
+                    }
+                }
             }
         }
     }
@@ -546,6 +804,20 @@ impl App {
             return;
         };
         self.request_metadata(project.path.clone());
+    }
+
+    fn request_current_project_ci_runs(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        self.request_ci_runs(project.path.clone());
+    }
+
+    fn request_current_project_languages(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        self.request_languages(project.path.clone());
     }
 
     fn request_visible_project_data(&mut self) {
@@ -573,7 +845,11 @@ impl App {
     }
 
     fn request_all_project_sizes(&mut self) {
-        let project_paths: Vec<_> = self.projects.iter().map(|project| project.path.clone()).collect();
+        let project_paths: Vec<_> = self
+            .projects
+            .iter()
+            .map(|project| project.path.clone())
+            .collect();
         for path in project_paths {
             self.request_size(path);
         }
@@ -599,20 +875,37 @@ impl App {
         }
 
         let tx = self.background_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let metadata = discover_project_metadata(&path);
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let metadata =
+                tokio::task::spawn_blocking(move || discover_project_metadata(&work_path))
+                    .await
+                    .unwrap_or_else(|_| ProjectMetadataSummary::default());
             let _ = tx.send(BackgroundResult::Metadata(path, metadata));
         });
     }
 
     fn request_git_status(&mut self, path: PathBuf) {
-        if self.git_status_cache.contains_key(&path) || !self.loading_git_statuses.insert(path.clone()) {
+        if self.git_status_cache.contains_key(&path)
+            || !self.loading_git_statuses.insert(path.clone())
+        {
             return;
         }
 
         let tx = self.background_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let git_status = git_status(&path);
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let git_status = tokio::task::spawn_blocking(move || git_status(&work_path))
+                .await
+                .unwrap_or_else(|_| "UNTRACKED".to_string());
             let _ = tx.send(BackgroundResult::GitStatus(path, git_status));
         });
     }
@@ -623,9 +916,76 @@ impl App {
         }
 
         let tx = self.background_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let size = directory_size(&path);
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let size = tokio::task::spawn_blocking(move || directory_size(&work_path))
+                .await
+                .unwrap_or(0);
             let _ = tx.send(BackgroundResult::Size(path, size));
+        });
+    }
+
+    fn request_ci_runs(&mut self, path: PathBuf) {
+        if self.ci_runs_cache.contains_key(&path) || !self.loading_ci_runs.insert(path.clone()) {
+            return;
+        }
+
+        let tx = self.background_tx.clone();
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let ci_runs = tokio::task::spawn_blocking(move || discover_ci_runs(&work_path))
+                .await
+                .ok()
+                .flatten();
+            let _ = tx.send(BackgroundResult::CiRuns(path, ci_runs));
+        });
+    }
+
+    fn request_languages(&mut self, path: PathBuf) {
+        if self.languages_cache.contains_key(&path) || !self.loading_languages.insert(path.clone())
+        {
+            return;
+        }
+
+        let tx = self.background_tx.clone();
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let languages = tokio::task::spawn_blocking(move || discover_languages(&work_path))
+                .await
+                .ok()
+                .flatten();
+            let _ = tx.send(BackgroundResult::Languages(path, languages));
+        });
+    }
+
+    fn request_targets(&mut self, path: PathBuf) {
+        if self.target_cache.contains_key(&path) || !self.loading_targets.insert(path.clone()) {
+            return;
+        }
+
+        let tx = self.background_tx.clone();
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+            let work_path = path.clone();
+            let targets = tokio::task::spawn_blocking(move || discover_targets(&work_path))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(BackgroundResult::Targets(path, targets));
         });
     }
 
@@ -637,7 +997,9 @@ impl App {
             KeyCode::Home => Some(InputRequest::GoToStart),
             KeyCode::End => Some(InputRequest::GoToEnd),
             KeyCode::Delete => Some(InputRequest::DeleteNextChar),
-            KeyCode::Char(c) if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT => {
+            KeyCode::Char(c)
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+            {
                 Some(InputRequest::InsertChar(c))
             }
             _ => None,
@@ -657,6 +1019,7 @@ impl App {
     fn active_filter_is_non_empty(&self) -> bool {
         match self.focus {
             Focus::Projects => !self.project_query.is_empty(),
+            Focus::CiRuns => false,
             Focus::Targets => !self.target_query.is_empty(),
         }
     }
@@ -668,6 +1031,7 @@ impl App {
                 self.project_query = self.project_input.value().to_string();
                 self.update_project_filter();
             }
+            Focus::CiRuns => {}
             Focus::Targets => {
                 self.target_input.handle(request);
                 self.target_query = self.target_input.value().to_string();
@@ -680,11 +1044,26 @@ impl App {
         self.filter_mode = false;
         match self.focus {
             Focus::Projects => {
-                self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+                self.cursor = if self.filtered_projects.is_empty() {
+                    -1
+                } else {
+                    0
+                };
                 self.refresh_targets();
             }
+            Focus::CiRuns => {
+                self.ci_cursor = if self.project_ci_runs().is_some() {
+                    0
+                } else {
+                    -1
+                };
+            }
             Focus::Targets => {
-                self.target_cursor = if self.filtered_targets.is_empty() { -1 } else { 0 };
+                self.target_cursor = if self.filtered_targets.is_empty() {
+                    -1
+                } else {
+                    0
+                };
             }
         }
     }
@@ -698,12 +1077,25 @@ impl App {
         self.project_input.reset();
         self.project_query.clear();
         self.update_project_filter();
-        self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+        self.cursor = if self.filtered_projects.is_empty() {
+            -1
+        } else {
+            0
+        };
 
         self.target_input.reset();
         self.target_query.clear();
         self.update_target_filter();
-        self.target_cursor = if self.filtered_targets.is_empty() { -1 } else { 0 };
+        self.target_cursor = if self.filtered_targets.is_empty() {
+            -1
+        } else {
+            0
+        };
+        self.ci_cursor = if self.project_ci_runs().is_some() {
+            0
+        } else {
+            -1
+        };
 
         self.refresh_targets();
     }
@@ -713,17 +1105,25 @@ impl App {
             self.targets.clear();
             self.filtered_targets.clear();
             self.target_cursor = -1;
+            self.ci_cursor = -1;
             return;
         };
 
         let path = project.path.clone();
-        self.targets = self
-            .target_cache
-            .entry(path.clone())
-            .or_insert_with(|| discover_targets(&path))
-            .clone();
-
-        self.rebuild_target_matcher();
+        if let Some(targets) = self.target_cache.get(&path) {
+            self.targets = targets.clone();
+            self.rebuild_target_matcher();
+        } else {
+            self.targets.clear();
+            self.filtered_targets.clear();
+            self.target_cursor = -1;
+            self.request_targets(path);
+        }
+        self.ci_cursor = if self.project_ci_runs().is_some() {
+            0
+        } else {
+            -1
+        };
     }
 
     fn refresh_target_status(&mut self) {
@@ -776,7 +1176,9 @@ impl App {
 
     fn mark_project_opened(&mut self, project_path: &Path) {
         let key = project_path.to_string_lossy().into_owned();
-        self.recent_projects.entries.insert(key, unix_timestamp_now());
+        self.recent_projects
+            .entries
+            .insert(key, unix_timestamp_now());
         let _ = save_recent_projects(&self.recent_projects);
 
         let selected_path = self.current_project().map(|project| project.path.clone());
@@ -799,7 +1201,9 @@ impl App {
         let injector = self.project_matcher.injector();
         for project in self.projects.clone() {
             injector.push(project, |project, cols| {
-                cols[0] = Utf32String::from(format!("{} {}", project.name, project.path.display()).as_str());
+                cols[0] = Utf32String::from(
+                    format!("{} {}", project.name, project.path.display()).as_str(),
+                );
             });
         }
         self.update_project_filter();
@@ -848,7 +1252,11 @@ impl App {
             .snapshot()
             .matched_items(..)
             .map(|item| item.data.clone())
-            .filter_map(|project| self.projects.iter().position(|candidate| candidate.path == project.path))
+            .filter_map(|project| {
+                self.projects
+                    .iter()
+                    .position(|candidate| candidate.path == project.path)
+            })
             .collect();
 
         if self.filtered_projects.is_empty() {
@@ -857,7 +1265,9 @@ impl App {
             self.filtered_targets.clear();
             self.target_cursor = -1;
         } else {
-            self.cursor = self.cursor.clamp(0, self.filtered_projects.len() as isize - 1);
+            self.cursor = self
+                .cursor
+                .clamp(0, self.filtered_projects.len() as isize - 1);
         }
     }
 
@@ -879,7 +1289,8 @@ impl App {
         self.target_cursor = if self.filtered_targets.is_empty() {
             -1
         } else {
-            self.target_cursor.clamp(0, self.filtered_targets.len() as isize - 1)
+            self.target_cursor
+                .clamp(0, self.filtered_targets.len() as isize - 1)
         };
     }
 }
@@ -937,7 +1348,11 @@ fn save_recent_projects(recent_projects: &RecentProjects) -> std::io::Result<()>
     fs::write(path, content)
 }
 
-fn target_runtime_paths(project_path: &Path, target_kind: &str, target_name: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn target_runtime_paths(
+    project_path: &Path,
+    target_kind: &str,
+    target_name: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
     let key = sanitize_runtime_key(&format!(
         "{}__{}__{}",
         project_path.display(),
@@ -961,7 +1376,11 @@ fn sanitize_runtime_key(value: &str) -> String {
 
 fn format_timestamp(timestamp: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|| "—".to_string())
 }
 
@@ -981,6 +1400,10 @@ fn sort_projects(projects: &mut [Project], recent_projects: &RecentProjects) {
 
         b_recent
             .cmp(&a_recent)
+            .then_with(|| match (a_recent, b_recent) {
+                (None, None) => b.has_git_dir.cmp(&a.has_git_dir),
+                _ => std::cmp::Ordering::Equal,
+            })
             .then_with(|| a.name.cmp(&b.name))
     });
 }
@@ -1046,6 +1469,7 @@ fn visit_dirs(dir: &Path, projects: &mut Vec<Project>, seen: &mut HashSet<PathBu
             projects.push(Project {
                 name: name.to_string(),
                 path: dir.to_path_buf(),
+                has_git_dir,
             });
         }
     }
@@ -1141,13 +1565,20 @@ fn discover_project_metadata(project_path: &Path) -> ProjectMetadataSummary {
         .exec()
         .ok();
 
-    let package = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.root_package().or_else(|| metadata.packages.first()));
+    let package = metadata.as_ref().and_then(|metadata| {
+        metadata
+            .root_package()
+            .or_else(|| metadata.packages.first())
+    });
 
     let package_name = package
         .map(|pkg| pkg.name.to_string())
-        .or_else(|| project_path.file_name().and_then(|name| name.to_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            project_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "—".to_string());
     let package_version = package
         .map(|pkg| pkg.version.to_string())
@@ -1207,6 +1638,138 @@ fn git_status(project_path: &Path) -> String {
     }
 }
 
+fn discover_ci_runs(project_path: &Path) -> Option<CiRunsData> {
+    let repo_url = github_repo_url(project_path)?;
+    let owner_repo = repo_url.strip_prefix("https://github.com/")?;
+    let current_branch = current_git_branch(project_path);
+    let runs_path = if let Some(branch) = current_branch.as_deref() {
+        format!(
+            "repos/{owner_repo}/actions/runs?per_page=25&branch={}",
+            shell_url_encode(branch)
+        )
+    } else {
+        format!("repos/{owner_repo}/actions/runs?per_page=25")
+    };
+    let output = Command::new("gh")
+        .args(["api", &runs_path])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct GhRunsResponse {
+        workflow_runs: Vec<GhRun>,
+    }
+
+    #[derive(Deserialize)]
+    struct GhRun {
+        html_url: String,
+        display_title: Option<String>,
+        head_branch: Option<String>,
+        created_at: String,
+        conclusion: Option<String>,
+        status: String,
+    }
+
+    let response: GhRunsResponse = serde_json::from_slice(&output.stdout).ok()?;
+    Some(CiRunsData {
+        repo: owner_repo.to_string(),
+        runs: response
+            .workflow_runs
+            .into_iter()
+            .map(|run| CiRun {
+                status: run.conclusion.unwrap_or(run.status),
+                branch: run.head_branch.unwrap_or_else(|| "—".to_string()),
+                title: run.display_title.unwrap_or_else(|| "—".to_string()),
+                created_at: run.created_at,
+                url: run.html_url,
+            })
+            .collect(),
+    })
+}
+
+fn github_repo_url(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    normalize_github_remote(remote.trim())
+}
+
+fn normalize_github_remote(remote: &str) -> Option<String> {
+    if let Some(rest) = remote.strip_prefix("git@github.com:") {
+        return Some(format!(
+            "https://github.com/{}",
+            rest.trim_end_matches(".git")
+        ));
+    }
+    if let Some(rest) = remote.strip_prefix("https://github.com/") {
+        return Some(format!(
+            "https://github.com/{}",
+            rest.trim_end_matches(".git")
+        ));
+    }
+    None
+}
+
+fn discover_languages(project_path: &Path) -> Option<LanguagesData> {
+    let output = Command::new("tokei")
+        .args([".", "--output", "json"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let object = value.as_object()?;
+    let mut languages = object
+        .iter()
+        .filter(|(name, _)| name.as_str() != "Total")
+        .filter_map(|(name, stats)| {
+            let stats = stats.as_object()?;
+            Some(LanguageStat {
+                name: name.clone(),
+                blanks: stats.get("blanks")?.as_u64()?,
+                code: stats.get("code")?.as_u64()?,
+                comments: stats.get("comments")?.as_u64()?,
+            })
+        })
+        .filter(|stat| stat.code > 0)
+        .collect::<Vec<_>>();
+
+    languages.sort_by(|a, b| b.code.cmp(&a.code).then_with(|| a.name.cmp(&b.name)));
+    if languages.is_empty() {
+        None
+    } else {
+        Some(LanguagesData { languages })
+    }
+}
+
+fn shell_url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 fn discover_targets(project_path: &Path) -> Vec<Target> {
     let Ok(metadata) = MetadataCommand::new()
         .current_dir(project_path)
@@ -1234,7 +1797,12 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
         })
         .collect::<Vec<_>>();
 
-    targets.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)));
+    targets.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
     targets
 }
 
