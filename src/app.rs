@@ -109,6 +109,7 @@ pub enum BackgroundResult {
     CiRuns(PathBuf, Option<CiRunsData>),
     Languages(PathBuf, Option<LanguagesData>),
     Targets(PathBuf, Vec<Target>),
+    ProjectCreated(Option<PathBuf>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -141,6 +142,9 @@ pub struct LanguagesData {
 
 pub struct App {
     pub running: bool,
+    pub confirm_delete_project: bool,
+    pub creating_project: bool,
+    pub creating_project_in_background: bool,
     pub counter: u8,
     pub cursor: isize,
     pub target_cursor: isize,
@@ -166,6 +170,7 @@ pub struct App {
     pub project_input: Input,
     pub ci_input: Input,
     pub target_input: Input,
+    pub create_project_input: Input,
     pub filtered_projects: Vec<usize>,
     pub filtered_ci_runs: Vec<usize>,
     pub filtered_targets: Vec<usize>,
@@ -200,6 +205,9 @@ impl Default for App {
 
         let mut app = Self {
             running: true,
+            confirm_delete_project: false,
+            creating_project: false,
+            creating_project_in_background: false,
             counter: 0,
             cursor: -1,
             target_cursor: -1,
@@ -225,6 +233,7 @@ impl Default for App {
             project_input: Input::default(),
             ci_input: Input::default(),
             target_input: Input::default(),
+            create_project_input: Input::default(),
             filtered_projects: Vec::new(),
             filtered_ci_runs: Vec::new(),
             filtered_targets: Vec::new(),
@@ -353,6 +362,31 @@ impl App {
     }
 
     pub fn handle_key_events(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        if self.confirm_delete_project {
+            match key_event.code {
+                KeyCode::Char('y') => self.delete_selected_project()?,
+                KeyCode::Char('n') | KeyCode::Esc => self.confirm_delete_project = false,
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.creating_project {
+            match key_event.code {
+                KeyCode::Esc => self.cancel_create_project(),
+                KeyCode::Enter => self.confirm_create_project()?,
+                KeyCode::Backspace
+                | KeyCode::Char(_)
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Delete => self.handle_create_project_input(key_event),
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.filter_mode {
             match key_event.code {
                 KeyCode::Esc => self.cancel_filter_mode(),
@@ -396,7 +430,13 @@ impl App {
             }
             KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('g') => self.pending_g = true,
+            KeyCode::Char('a') if self.focus == Focus::Projects => self.start_create_project(),
             KeyCode::Char('b') => self.toggle_selected_project_bookmark(),
+            KeyCode::Char('d') if self.focus == Focus::Projects => {
+                if self.current_project().is_some() {
+                    self.confirm_delete_project = true;
+                }
+            }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
@@ -451,12 +491,11 @@ impl App {
                 Focus::Targets => self.select_previous_target(),
             },
             KeyCode::Enter => match self.focus {
-                Focus::Projects => {}
+                Focus::Projects => self.open_selected_project()?,
                 Focus::CiRuns => self.open_selected_ci_run()?,
                 Focus::Targets => self.run_selected_target()?,
             },
             KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
-            KeyCode::Char('O') => self.open_selected_project()?,
             _ => {}
         }
         Ok(())
@@ -840,6 +879,23 @@ impl App {
                         self.rebuild_target_matcher();
                     }
                 }
+                BackgroundResult::ProjectCreated(project_path) => {
+                    self.creating_project_in_background = false;
+                    if let Some(project_path) = project_path.as_deref() {
+                        self.mark_project_opened(project_path);
+                    }
+                    self.reload_projects();
+                    if let Some(project_path) = project_path {
+                        if let Some(index) = self.filtered_projects.iter().position(|&project_index| {
+                            self.projects
+                                .get(project_index)
+                                .is_some_and(|project| project.path == project_path)
+                        }) {
+                            self.cursor = index as isize;
+                            self.refresh_targets();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1061,6 +1117,27 @@ impl App {
         self.apply_filter_request(InputRequest::DeletePrevChar);
     }
 
+    fn handle_create_project_input(&mut self, key_event: KeyEvent) {
+        let request = match key_event.code {
+            KeyCode::Backspace => Some(InputRequest::DeletePrevChar),
+            KeyCode::Left => Some(InputRequest::GoToPrevChar),
+            KeyCode::Right => Some(InputRequest::GoToNextChar),
+            KeyCode::Home => Some(InputRequest::GoToStart),
+            KeyCode::End => Some(InputRequest::GoToEnd),
+            KeyCode::Delete => Some(InputRequest::DeleteNextChar),
+            KeyCode::Char(c)
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+            {
+                Some(InputRequest::InsertChar(c))
+            }
+            _ => None,
+        };
+
+        if let Some(request) = request {
+            self.create_project_input.handle(request);
+        }
+    }
+
     fn active_filter_is_non_empty(&self) -> bool {
         match self.focus {
             Focus::Projects => !self.project_query.is_empty(),
@@ -1212,6 +1289,97 @@ impl App {
         });
     }
 
+    fn start_create_project(&mut self) {
+        self.creating_project = true;
+        self.create_project_input.reset();
+    }
+
+    fn cancel_create_project(&mut self) {
+        self.creating_project = false;
+        self.create_project_input.reset();
+    }
+
+    fn confirm_create_project(&mut self) -> color_eyre::Result<()> {
+        let value = self.create_project_input.value().trim().to_string();
+        if value.is_empty() {
+            self.cancel_create_project();
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.projects_root)?;
+
+        let created_project_path = if looks_like_git_url(&value) {
+            cloned_project_path(&self.projects_root, &value)
+        } else {
+            Some(self.projects_root.join(&value))
+        };
+
+        let tx = self.background_tx.clone();
+        let limiter = self.background_limiter.clone();
+        let projects_root = self.projects_root.clone();
+        self.cancel_create_project();
+        self.creating_project_in_background = true;
+
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+
+            let value = value.clone();
+            let projects_root = projects_root.clone();
+            let project_path = created_project_path.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                let mut command = if looks_like_git_url(&value) {
+                    let mut command = Command::new("git");
+                    command.args(["clone", &value]);
+                    command
+                } else {
+                    let mut command = Command::new("cargo");
+                    command.args(["new", &value]);
+                    command
+                };
+
+                command
+                    .current_dir(&projects_root)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+            })
+            .await;
+
+            if matches!(status, Ok(Ok(exit)) if exit.success()) {
+                let _ = tx.send(BackgroundResult::ProjectCreated(project_path));
+            } else {
+                let _ = tx.send(BackgroundResult::ProjectCreated(None));
+            }
+        });
+
+        Ok(())
+    }
+
+    fn reload_projects(&mut self) {
+        let selected_path = self.current_project().map(|project| project.path.clone());
+        self.projects = discover_projects(&self.projects_root);
+        sort_projects(&mut self.projects, &self.recent_projects);
+        self.rebuild_project_matcher();
+
+        if let Some(selected_path) = selected_path {
+            if let Some(index) = self.filtered_projects.iter().position(|&project_index| {
+                self.projects
+                    .get(project_index)
+                    .is_some_and(|project| project.path == selected_path)
+            }) {
+                self.cursor = index as isize;
+                self.refresh_targets();
+                return;
+            }
+        }
+
+        self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+        self.refresh_targets();
+    }
+
     fn toggle_selected_project_bookmark(&mut self) {
         let Some(project) = self.current_project() else {
             return;
@@ -1222,6 +1390,54 @@ impl App {
             self.bookmarked_projects.entries.remove(&key);
         }
         let _ = save_bookmarked_projects(&self.bookmarked_projects);
+    }
+
+    fn delete_selected_project(&mut self) -> color_eyre::Result<()> {
+        let Some(project) = self.current_project() else {
+            self.confirm_delete_project = false;
+            return Ok(());
+        };
+
+        let project_path = project.path.clone();
+        fs::remove_dir_all(&project_path)?;
+
+        let key = project_path.to_string_lossy().to_string();
+        self.bookmarked_projects.entries.remove(&key);
+        self.recent_projects.entries.remove(&key);
+        let _ = save_bookmarked_projects(&self.bookmarked_projects);
+        let _ = save_recent_projects(&self.recent_projects);
+
+        self.projects.retain(|project| project.path != project_path);
+        self.metadata_cache.remove(&project_path);
+        self.ci_runs_cache.remove(&project_path);
+        self.languages_cache.remove(&project_path);
+        self.git_status_cache.remove(&project_path);
+        self.size_cache.remove(&project_path);
+        self.target_cache.remove(&project_path);
+        self.loading_metadata.remove(&project_path);
+        self.loading_ci_runs.remove(&project_path);
+        self.loading_languages.remove(&project_path);
+        self.loading_git_statuses.remove(&project_path);
+        self.loading_sizes.remove(&project_path);
+        self.loading_targets.remove(&project_path);
+        self.target_statuses
+            .retain(|status| status.project_path != project_path);
+
+        self.confirm_delete_project = false;
+        self.rebuild_project_matcher();
+        if self.filtered_projects.is_empty() {
+            self.cursor = -1;
+            self.targets.clear();
+            self.filtered_targets.clear();
+            self.target_cursor = -1;
+            self.filtered_ci_runs.clear();
+            self.ci_cursor = -1;
+        } else {
+            self.cursor = self.cursor.clamp(0, self.filtered_projects.len() as isize - 1);
+            self.refresh_targets();
+        }
+
+        Ok(())
     }
 
     fn mark_project_opened(&mut self, project_path: &Path) {
@@ -1852,6 +2068,28 @@ fn discover_languages(project_path: &Path) -> Option<LanguagesData> {
         None
     } else {
         Some(LanguagesData { languages })
+    }
+}
+
+fn looks_like_git_url(value: &str) -> bool {
+    value.starts_with("git@")
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.ends_with(".git")
+        || value.contains("github.com/")
+}
+
+fn cloned_project_path(projects_root: &Path, value: &str) -> Option<PathBuf> {
+    let repo = value
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()?
+        .trim_end_matches(".git");
+
+    if repo.is_empty() {
+        None
+    } else {
+        Some(projects_root.join(repo))
     }
 }
 

@@ -1,11 +1,11 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, Wrap,
+        Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, Wrap,
     },
 };
 use unicode_width::UnicodeWidthStr;
@@ -100,6 +100,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.filter_mode,
             "Search targets",
         );
+    }
+
+    if app.confirm_delete_project {
+        render_delete_dialog(frame, app);
+    }
+
+    if app.creating_project {
+        render_create_project_dialog(frame, app);
+    }
+
+    if app.creating_project_in_background {
+        render_create_project_pending_dialog(frame);
     }
 }
 
@@ -418,6 +430,78 @@ fn render_targets(frame: &mut Frame, app: &App, area: Rect) {
             &mut scrollbar_state,
         );
     }
+}
+
+fn render_delete_dialog(frame: &mut Frame, app: &App) {
+    let Some(project) = app.current_project() else {
+        return;
+    };
+
+    let area = centered_rect(frame.area(), 56, 5);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!("Delete {}? [y/n]", project.name))
+            .alignment(Alignment::Center)
+            .block(
+                Block::bordered()
+                    .title("Confirm delete")
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .style(Style::default().fg(Color::Red).bg(Color::Black)),
+        area,
+    );
+}
+
+fn render_create_project_dialog(frame: &mut Frame, app: &App) {
+    let area = centered_rect(frame.area(), 72, 5);
+    let width = area.width.saturating_sub(2) as usize;
+    let scroll = app.create_project_input.visual_scroll(width);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(app.create_project_input.value())
+            .alignment(Alignment::Left)
+            .scroll((0, scroll as u16))
+            .block(
+                Block::bordered()
+                    .title("New project: git URL or cargo name")
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .style(Style::default().fg(Color::Green).bg(Color::Black)),
+        area,
+    );
+
+    let cursor = app.create_project_input.visual_cursor().max(scroll) - scroll + 1;
+    frame.set_cursor_position((area.x + cursor as u16, area.y + 1));
+}
+
+fn render_create_project_pending_dialog(frame: &mut Frame) {
+    let area = centered_rect(frame.area(), 40, 5);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new("Creating project…")
+            .alignment(Alignment::Center)
+            .block(
+                Block::bordered()
+                    .title("Please wait")
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+        area,
+    );
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let [area] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    area
 }
 
 fn render_search_input(
