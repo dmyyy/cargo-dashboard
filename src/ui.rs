@@ -110,27 +110,34 @@ fn render_metadata(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|project| project.path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let secondary_style = Style::default().fg(INACTIVE_TEXT_COLOR);
-        let body = vec![
+        let mut body = vec![
             Line::from(Span::styled(path, secondary_style)),
             Line::default(),
             Line::from(Span::styled(metadata.description.clone(), secondary_style)),
         ];
 
+        if let Some(description) = app.current_target_description() {
+            body.push(Line::default());
+            body.push(Line::from(vec![
+                Span::styled("Target: ", Style::default().fg(ACTIVE_TEXT_COLOR)),
+                Span::styled(description.to_string(), secondary_style),
+            ]));
+        }
+
         (
             format!(
-                "{}{}{} {}",
+                "{}{}{}",
                 metadata.package_name,
                 if metadata.package_version == "—" {
                     String::new()
                 } else {
-                    format!(" @{}", metadata.package_version)
+                    format!(" v{}", metadata.package_version)
                 },
                 if metadata.git_branch == "—" {
                     String::new()
                 } else {
                     format!("  {}", metadata.git_branch)
-                },
-                metadata.git_status
+                }
             ),
             body,
         )

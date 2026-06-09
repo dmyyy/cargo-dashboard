@@ -30,6 +30,7 @@ pub struct Project {
     pub name: String,
     pub path: PathBuf,
     pub has_git_dir: bool,
+    pub is_workspace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub struct Target {
     pub kind: String,
     pub name: String,
     pub path: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +455,7 @@ impl App {
                 Focus::CiRuns => self.open_selected_ci_run()?,
                 Focus::Targets => self.run_selected_target()?,
             },
+            KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
             KeyCode::Char('O') => self.open_selected_project()?,
             _ => {}
         }
@@ -686,6 +689,8 @@ impl App {
         let run_command = match target_kind.as_str() {
             "bin" => format!("cargo run --bin {}", shell_escape_arg(&target_name)),
             "example" => format!("cargo run --example {}", shell_escape_arg(&target_name)),
+            "test" => format!("cargo test --test {}", shell_escape_arg(&target_name)),
+            "bench" => format!("cargo bench --bench {}", shell_escape_arg(&target_name)),
             _ => return Ok(()),
         };
 
@@ -734,6 +739,31 @@ impl App {
         Ok(())
     }
 
+    pub fn edit_selected_target(&mut self) -> color_eyre::Result<()> {
+        let Some(project) = self.current_project() else {
+            return Ok(());
+        };
+        let Some(target) = self.current_target() else {
+            return Ok(());
+        };
+
+        let target_path = project.path.join(&target.path);
+        let command = format!(
+            "zellij action new-pane -f --close-on-exit --height 40 --width 140 --cwd {} -- hx {}",
+            shell_escape_path(&project.path),
+            shell_escape_path(&target_path),
+        );
+
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(())
+    }
+
     pub fn current_project(&self) -> Option<&Project> {
         let visible_index = usize::try_from(self.cursor).ok()?;
         let project_index = *self.filtered_projects.get(visible_index)?;
@@ -744,6 +774,13 @@ impl App {
         let visible_index = usize::try_from(self.target_cursor).ok()?;
         let target_index = *self.filtered_targets.get(visible_index)?;
         self.targets.get(target_index)
+    }
+
+    pub fn current_target_description(&self) -> Option<&str> {
+        if self.focus != Focus::Targets {
+            return None;
+        }
+        self.current_target()?.description.as_deref()
     }
 
     pub fn targets_loading(&self) -> bool {
@@ -1504,19 +1541,32 @@ fn visit_dirs(dir: &Path, projects: &mut Vec<Project>, seen: &mut HashSet<PathBu
         }
     }
 
+    let is_workspace = has_cargo_toml && is_workspace_root(dir);
+
     if (has_git_dir || has_cargo_toml) && seen.insert(dir.to_path_buf()) {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
             projects.push(Project {
                 name: name.to_string(),
                 path: dir.to_path_buf(),
                 has_git_dir,
+                is_workspace,
             });
         }
+    }
+
+    if is_workspace {
+        return;
     }
 
     for child in child_dirs {
         visit_dirs(&child, projects, seen);
     }
+}
+
+fn is_workspace_root(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .is_some_and(|cargo_toml| cargo_toml.contains("[workspace]"))
 }
 
 fn should_skip_project_scan_dir(name: &str) -> bool {
@@ -1605,21 +1655,29 @@ fn discover_project_metadata(project_path: &Path) -> ProjectMetadataSummary {
         .exec()
         .ok();
 
-    let package = metadata.as_ref().and_then(|metadata| {
-        metadata
-            .root_package()
-            .or_else(|| metadata.packages.first())
-    });
+    let workspace_root = metadata
+        .as_ref()
+        .map(|metadata| metadata.workspace_root.as_std_path() == project_path)
+        .unwrap_or(false);
+    let package = metadata.as_ref().and_then(|metadata| metadata.root_package());
 
-    let package_name = package
-        .map(|pkg| pkg.name.to_string())
-        .or_else(|| {
-            project_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "—".to_string());
+    let package_name = if workspace_root && package.is_none() {
+        project_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "—".to_string())
+    } else {
+        package
+            .map(|pkg| pkg.name.to_string())
+            .or_else(|| {
+                project_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "—".to_string())
+    };
     let package_version = package
         .map(|pkg| pkg.version.to_string())
         .unwrap_or_else(|| "—".to_string());
@@ -1823,7 +1881,9 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
         .packages
         .iter()
         .flat_map(|package| {
-            package.targets.iter().filter_map(|target| {
+            let manifest_descriptions =
+                load_target_descriptions(package.manifest_path.as_std_path());
+            package.targets.iter().filter_map(move |target| {
                 select_target_kind(target).map(|kind| Target {
                     kind: kind.to_string(),
                     name: target.name.clone(),
@@ -1832,6 +1892,10 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
                         .strip_prefix(project_path)
                         .map(|path| path.to_string())
                         .unwrap_or_else(|_| target.src_path.to_string()),
+                    description: manifest_descriptions
+                        .get(&(kind.to_string(), target.name.clone()))
+                        .cloned()
+                        .flatten(),
                 })
             })
         })
@@ -1846,12 +1910,76 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
     targets
 }
 
+fn load_target_descriptions(
+    manifest_path: &Path,
+) -> HashMap<(String, String), Option<String>> {
+    let Ok(cargo_toml) = fs::read_to_string(manifest_path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&cargo_toml) else {
+        return HashMap::new();
+    };
+
+    let mut descriptions = HashMap::new();
+    for (manifest_key, target_kind) in [
+        ("bin", "bin"),
+        ("example", "example"),
+        ("test", "test"),
+        ("bench", "bench"),
+    ] {
+        if let Some(items) = value.get(manifest_key).and_then(|items| items.as_array()) {
+            for item in items {
+                let Some(table) = item.as_table() else {
+                    continue;
+                };
+                let Some(name) = table.get("name").and_then(|name| name.as_str()) else {
+                    continue;
+                };
+                let description = table
+                    .get("description")
+                    .and_then(|description| description.as_str())
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(ToOwned::to_owned);
+                descriptions.insert((target_kind.to_string(), name.to_string()), description);
+            }
+        }
+
+        let metadata_examples = value
+            .get("package")
+            .and_then(|package| package.get("metadata"))
+            .and_then(|metadata| metadata.get(manifest_key))
+            .and_then(|targets| targets.as_table());
+
+        if let Some(targets) = metadata_examples {
+            for (name, target_metadata) in targets {
+                let description = target_metadata
+                    .get("description")
+                    .and_then(|description| description.as_str())
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(ToOwned::to_owned);
+                if description.is_some() {
+                    descriptions.insert((target_kind.to_string(), name.to_string()), description);
+                }
+            }
+        }
+    }
+
+    descriptions
+}
+
 fn select_target_kind(target: &CargoTarget) -> Option<&'static str> {
     if target.is_bin() {
         Some("bin")
     } else if target.is_example() {
         Some("example")
+    } else if target.is_test() {
+        Some("test")
+    } else if target.is_bench() {
+        Some("bench")
     } else {
         None
     }
 }
+
