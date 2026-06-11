@@ -437,14 +437,14 @@ fn render_delete_dialog(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(frame.area(), 56, 5);
+    let area = centered_rect(frame.area(), 56, 3);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(format!("Delete {}? [y/n]", project.name))
             .alignment(Alignment::Center)
             .block(
                 Block::bordered()
-                    .title("Confirm delete")
+                    .title("Confirm Deletion")
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
@@ -454,7 +454,7 @@ fn render_delete_dialog(frame: &mut Frame, app: &App) {
 }
 
 fn render_create_project_dialog(frame: &mut Frame, app: &App) {
-    let area = centered_rect(frame.area(), 72, 5);
+    let area = centered_rect(frame.area(), 72, 3);
     let width = area.width.saturating_sub(2) as usize;
     let scroll = app.create_project_input.visual_scroll(width);
 
@@ -465,7 +465,7 @@ fn render_create_project_dialog(frame: &mut Frame, app: &App) {
             .scroll((0, scroll as u16))
             .block(
                 Block::bordered()
-                    .title("New project: git URL or cargo name")
+                    .title("Add Project: name OR git url")
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )

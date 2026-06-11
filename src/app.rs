@@ -110,6 +110,7 @@ pub enum BackgroundResult {
     Languages(PathBuf, Option<LanguagesData>),
     Targets(PathBuf, Vec<Target>),
     ProjectCreated(Option<PathBuf>),
+    ProjectCleaned(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -432,10 +433,14 @@ impl App {
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('a') if self.focus == Focus::Projects => self.start_create_project(),
             KeyCode::Char('b') => self.toggle_selected_project_bookmark(),
+            KeyCode::Char('c') if self.focus == Focus::Projects => self.clean_selected_project(),
             KeyCode::Char('d') if self.focus == Focus::Projects => {
                 if self.current_project().is_some() {
                     self.confirm_delete_project = true;
                 }
+            }
+            KeyCode::Char('r' | 'R') if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.rescan_selected_project()
             }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
@@ -886,15 +891,22 @@ impl App {
                     }
                     self.reload_projects();
                     if let Some(project_path) = project_path {
-                        if let Some(index) = self.filtered_projects.iter().position(|&project_index| {
-                            self.projects
-                                .get(project_index)
-                                .is_some_and(|project| project.path == project_path)
-                        }) {
+                        if let Some(index) =
+                            self.filtered_projects.iter().position(|&project_index| {
+                                self.projects
+                                    .get(project_index)
+                                    .is_some_and(|project| project.path == project_path)
+                            })
+                        {
                             self.cursor = index as isize;
                             self.refresh_targets();
                         }
                     }
+                }
+                BackgroundResult::ProjectCleaned(path) => {
+                    self.size_cache.remove(&path);
+                    self.loading_sizes.remove(&path);
+                    self.request_size(path);
                 }
             }
         }
@@ -1376,7 +1388,11 @@ impl App {
             }
         }
 
-        self.cursor = if self.filtered_projects.is_empty() { -1 } else { 0 };
+        self.cursor = if self.filtered_projects.is_empty() {
+            -1
+        } else {
+            0
+        };
         self.refresh_targets();
     }
 
@@ -1390,6 +1406,74 @@ impl App {
             self.bookmarked_projects.entries.remove(&key);
         }
         let _ = save_bookmarked_projects(&self.bookmarked_projects);
+    }
+
+    fn clean_selected_project(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+
+        if !project.path.join("Cargo.toml").exists() {
+            return;
+        }
+
+        let path = project.path.clone();
+        self.size_cache.remove(&path);
+        self.loading_sizes.remove(&path);
+
+        let tx = self.background_tx.clone();
+        let limiter = self.background_limiter.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
+
+            let work_path = path.clone();
+            let cleaned = tokio::task::spawn_blocking(move || {
+                Command::new("cargo")
+                    .arg("clean")
+                    .current_dir(&work_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+
+            if cleaned {
+                let _ = tx.send(BackgroundResult::ProjectCleaned(path));
+            }
+        });
+    }
+
+    fn rescan_selected_project(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+
+        let path = project.path.clone();
+        self.metadata_cache.remove(&path);
+        self.ci_runs_cache.remove(&path);
+        self.languages_cache.remove(&path);
+        self.git_status_cache.remove(&path);
+        self.size_cache.remove(&path);
+        self.target_cache.remove(&path);
+        self.loading_metadata.remove(&path);
+        self.loading_ci_runs.remove(&path);
+        self.loading_languages.remove(&path);
+        self.loading_git_statuses.remove(&path);
+        self.loading_sizes.remove(&path);
+        self.loading_targets.remove(&path);
+
+        self.refresh_targets();
+        self.request_metadata(path.clone());
+        self.request_ci_runs(path.clone());
+        self.request_languages(path.clone());
+        self.request_git_status(path.clone());
+        self.request_size(path);
     }
 
     fn delete_selected_project(&mut self) -> color_eyre::Result<()> {
@@ -1433,7 +1517,9 @@ impl App {
             self.filtered_ci_runs.clear();
             self.ci_cursor = -1;
         } else {
-            self.cursor = self.cursor.clamp(0, self.filtered_projects.len() as isize - 1);
+            self.cursor = self
+                .cursor
+                .clamp(0, self.filtered_projects.len() as isize - 1);
             self.refresh_targets();
         }
 
@@ -1875,7 +1961,9 @@ fn discover_project_metadata(project_path: &Path) -> ProjectMetadataSummary {
         .as_ref()
         .map(|metadata| metadata.workspace_root.as_std_path() == project_path)
         .unwrap_or(false);
-    let package = metadata.as_ref().and_then(|metadata| metadata.root_package());
+    let package = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.root_package());
 
     let package_name = if workspace_root && package.is_none() {
         project_path
@@ -2148,9 +2236,7 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
     targets
 }
 
-fn load_target_descriptions(
-    manifest_path: &Path,
-) -> HashMap<(String, String), Option<String>> {
+fn load_target_descriptions(manifest_path: &Path) -> HashMap<(String, String), Option<String>> {
     let Ok(cargo_toml) = fs::read_to_string(manifest_path) else {
         return HashMap::new();
     };
@@ -2220,4 +2306,3 @@ fn select_target_kind(target: &CargoTarget) -> Option<&'static str> {
         None
     }
 }
-
