@@ -8,6 +8,7 @@ use ratatui::{
         ScrollbarState, Table, Wrap,
     },
 };
+use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, CiRun, Focus, RunProfile, TargetStatusKind};
@@ -20,55 +21,74 @@ const SELECTED_TEXT_COLOR: Color = Color::Indexed(0);
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let columns = Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
+        Constraint::Percentage(30),
+        Constraint::Percentage(35),
+        Constraint::Percentage(35),
     ])
     .spacing(1);
 
     let [left, middle, right] = frame.area().layout(&columns);
 
+    let has_running = app.running_target_statuses().next().is_some();
     let has_ci_runs = app.project_ci_runs().is_some();
-
     let has_languages = app.project_languages().is_some();
 
-    match (has_ci_runs, has_languages) {
-        (true, true) => {
-            let left_chunks = Layout::vertical([
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-            ])
-            .split(left);
-            render_metadata(frame, app, left_chunks[0]);
-            render_languages(frame, app, left_chunks[1]);
-            render_ci_runs(frame, app, left_chunks[2]);
+    match (has_running, has_ci_runs, has_languages) {
+        (false, false, false) => {
+            render_metadata(frame, app, left);
         }
-        (true, false) => {
-            let left_chunks =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(left);
+        _ => {
+            let section_count = 1 + has_running as u32 + has_ci_runs as u32 + has_languages as u32;
+            let mut constraints = vec![Constraint::Ratio(1, section_count)];
+            if has_running {
+                constraints.push(Constraint::Ratio(1, section_count));
+            }
+            if has_ci_runs {
+                constraints.push(Constraint::Ratio(1, section_count));
+            }
+            if has_languages {
+                constraints.push(Constraint::Ratio(1, section_count));
+            }
+
+            let left_chunks = Layout::vertical(constraints).split(left);
             render_metadata(frame, app, left_chunks[0]);
-            render_ci_runs(frame, app, left_chunks[1]);
+
+            let mut index = 1;
+            if has_running {
+                render_running(frame, app, left_chunks[index]);
+                index += 1;
+            }
+            if has_ci_runs {
+                render_ci_runs(frame, app, left_chunks[index]);
+                index += 1;
+            }
+            if has_languages {
+                render_languages(frame, app, left_chunks[index]);
+            }
         }
-        (false, true) => {
-            let left_chunks =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(left);
-            render_metadata(frame, app, left_chunks[0]);
-            render_languages(frame, app, left_chunks[1]);
-        }
-        (false, false) => render_metadata(frame, app, left),
     }
 
-    let show_project_search =
-        !app.project_query.is_empty() || (app.focus == Focus::Projects && app.filter_mode);
+    let show_terminal =
+        app.focus == Focus::RunningTargets && app.current_running_target_status().is_some();
+
+    let show_project_search = !show_terminal
+        && (!app.project_query.is_empty() || (app.focus == Focus::Projects && app.filter_mode));
     let middle_chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(if show_project_search { 3 } else { 0 }),
     ])
     .split(middle);
-    render_projects(frame, app, middle_chunks[0]);
+    if show_terminal {
+        let terminal_area = Rect {
+            x: middle.x,
+            y: middle.y,
+            width: middle.width.saturating_add(1).saturating_add(right.width),
+            height: middle.height,
+        };
+        render_running_terminal(frame, app, terminal_area);
+    } else {
+        render_projects(frame, app, middle_chunks[0]);
+    }
     if show_project_search {
         render_search_input(
             frame,
@@ -79,27 +99,24 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let show_target_search =
-        !app.target_query.is_empty() || (app.focus == Focus::Targets && app.filter_mode);
-    let has_running = app.running_target_statuses().next().is_some();
-    let right_chunks = Layout::vertical([
-        Constraint::Length(if has_running { 6 } else { 0 }),
-        Constraint::Min(0),
-        Constraint::Length(if show_target_search { 3 } else { 0 }),
-    ])
-    .split(right);
-    if has_running {
-        render_running(frame, app, right_chunks[0]);
-    }
-    render_targets(frame, app, right_chunks[1]);
-    if show_target_search {
-        render_search_input(
-            frame,
-            right_chunks[2],
-            &app.target_input,
-            app.filter_mode,
-            "Search targets",
-        );
+    if !show_terminal {
+        let show_target_search =
+            !app.target_query.is_empty() || (app.focus == Focus::Targets && app.filter_mode);
+        let right_chunks = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(if show_target_search { 3 } else { 0 }),
+        ])
+        .split(right);
+        render_targets(frame, app, right_chunks[0]);
+        if show_target_search {
+            render_search_input(
+                frame,
+                right_chunks[1],
+                &app.target_input,
+                app.filter_mode,
+                "Search targets",
+            );
+        }
     }
 
     if app.confirm_delete_project {
@@ -540,22 +557,40 @@ fn format_size(bytes: u64) -> String {
 fn render_running(frame: &mut Frame, app: &App, area: Rect) {
     let rows: Vec<Row> = app
         .running_target_statuses()
-        .map(|status| {
-            let indicator = if status.kind == TargetStatusKind::Building {
-                spinner_frame(app)
+        .enumerate()
+        .map(|(index, status)| {
+            let is_selected =
+                app.focus == Focus::RunningTargets && app.running_cursor == index as isize;
+            let row_style = if is_selected {
+                Style::default()
+                    .fg(SELECTED_TEXT_COLOR)
+                    .bg(ACTIVE_COLOR)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                String::new()
+                Style::default().fg(if app.focus == Focus::RunningTargets {
+                    ACTIVE_TEXT_COLOR
+                } else {
+                    INACTIVE_TEXT_COLOR
+                })
+            };
+            let indicator = match status.kind {
+                TargetStatusKind::Failed => {
+                    Cell::from(Line::from(Span::styled("✗", row_style.fg(Color::Red))))
+                }
+                TargetStatusKind::Building | TargetStatusKind::Running => {
+                    Cell::from(spinner_frame(app))
+                }
             };
             Row::new(vec![
                 indicator,
-                format!("{}/{}", status.project_name, status.target_name),
-                match status.profile {
+                Cell::from(format!("{}/{}", status.project_name, status.target_name)),
+                Cell::from(match status.profile {
                     RunProfile::Debug => "debug".to_string(),
                     RunProfile::Release => "release".to_string(),
-                },
-                format_duration(status.started_at.map(|started_at| started_at.elapsed())),
+                }),
+                Cell::from(format_duration(status.started_at.map(|started_at| started_at.elapsed()))),
             ])
-            .style(Style::default().fg(ACTIVE_TEXT_COLOR))
+            .style(row_style)
         })
         .collect();
 
@@ -579,9 +614,37 @@ fn render_running(frame: &mut Frame, app: &App, area: Rect) {
                 .title_alignment(Alignment::Center)
                 .border_type(BorderType::Rounded),
         )
-        .fg(Color::Green),
+        .fg(if app.focus == Focus::RunningTargets {
+            ACTIVE_COLOR
+        } else {
+            INACTIVE_COLOR
+        }),
         area,
     );
+}
+
+fn render_running_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    app.resize_selected_running_terminal(inner.width, inner.height);
+
+    let block = Block::bordered()
+        .title("Terminal")
+        .title_alignment(Alignment::Center)
+        .border_type(BorderType::Rounded);
+
+    if let Some(parser) = app.selected_running_terminal_parser()
+        && let Ok(parser) = parser.lock()
+    {
+        frame.render_widget(PseudoTerminal::new(parser.screen()).block(block), area);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No running target selected").block(block),
+            area,
+        );
+    }
 }
 
 fn spinner_frame(app: &App) -> String {

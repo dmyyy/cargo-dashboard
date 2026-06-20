@@ -8,6 +8,7 @@ use nucleo::{
     Config, Nucleo, Utf32String,
     pattern::{CaseMatching, Normalization},
 };
+use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     DefaultTerminal,
     style::{Color, Style},
@@ -17,9 +18,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    thread,
     time::Instant,
 };
 use tokio::sync::{Semaphore, mpsc};
@@ -35,15 +38,18 @@ pub struct Project {
 
 #[derive(Debug, Clone)]
 pub struct Target {
+    pub package_name: String,
     pub kind: String,
     pub name: String,
     pub path: String,
     pub description: Option<String>,
+    pub required_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
+    RunningTargets,
     CiRuns,
     Targets,
 }
@@ -52,6 +58,7 @@ pub enum Focus {
 pub enum TargetStatusKind {
     Building,
     Running,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,13 +80,19 @@ pub struct TargetStatus {
     pub project_path: PathBuf,
     pub target_name: String,
     pub target_kind: String,
+    pub key: String,
     pub profile: RunProfile,
-    pub status_path: PathBuf,
-    pub log_path: PathBuf,
-    pub pid_path: PathBuf,
     pub pid: Option<u32>,
     pub started_at: Option<Instant>,
     pub stats: ProcessStats,
+}
+
+pub struct RunningSession {
+    pub key: String,
+    pub parser: Arc<Mutex<vt100::Parser>>,
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub child: Box<dyn portable_pty::Child + Send>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -149,6 +162,7 @@ pub struct App {
     pub counter: u8,
     pub cursor: isize,
     pub target_cursor: isize,
+    pub running_cursor: isize,
     pub ci_cursor: isize,
     pub targets: Vec<Target>,
     pub target_cache: HashMap<PathBuf, Vec<Target>>,
@@ -178,6 +192,7 @@ pub struct App {
     pub project_matcher: Nucleo<Project>,
     pub target_matcher: Nucleo<Target>,
     pub target_statuses: Vec<TargetStatus>,
+    pub running_sessions: Vec<RunningSession>,
     pub spinner: Spinner,
     pub spinner_state: SpinnerState,
     pub spinner_last_tick: Instant,
@@ -212,6 +227,7 @@ impl Default for App {
             counter: 0,
             cursor: -1,
             target_cursor: -1,
+            running_cursor: -1,
             ci_cursor: -1,
             targets: Vec::new(),
             target_cache: HashMap::new(),
@@ -241,6 +257,7 @@ impl Default for App {
             project_matcher: new_matcher(),
             target_matcher: new_matcher(),
             target_statuses: Vec::new(),
+            running_sessions: Vec::new(),
             spinner: Spinner::default().style(Style::default().fg(Color::Yellow)),
             spinner_state: SpinnerState::new(SpinnerType::Moon),
             spinner_last_tick: Instant::now(),
@@ -293,6 +310,12 @@ impl App {
             status.project_path == project.path
                 && status.target_name == target.name
                 && status.target_kind == target.kind
+                && matches!(
+                    status.kind,
+                    TargetStatusKind::Building
+                        | TargetStatusKind::Running
+                        | TargetStatusKind::Failed
+                )
         })
     }
 
@@ -300,9 +323,51 @@ impl App {
         self.target_statuses.iter().filter(|status| {
             matches!(
                 status.kind,
-                TargetStatusKind::Building | TargetStatusKind::Running
+                TargetStatusKind::Building | TargetStatusKind::Running | TargetStatusKind::Failed
             )
         })
+    }
+
+    pub fn current_running_target_status(&self) -> Option<&TargetStatus> {
+        let visible_index = usize::try_from(self.running_cursor).ok()?;
+        self.running_target_statuses().nth(visible_index)
+    }
+
+    pub fn selected_running_terminal_parser(&self) -> Option<Arc<Mutex<vt100::Parser>>> {
+        let key = self.current_running_target_status()?.key.clone();
+        let session = self
+            .running_sessions
+            .iter()
+            .find(|session| session.key == key)?;
+        Some(Arc::clone(&session.parser))
+    }
+
+    pub fn resize_selected_running_terminal(&mut self, width: u16, height: u16) {
+        let Some(key) = self
+            .current_running_target_status()
+            .map(|status| status.key.clone())
+        else {
+            return;
+        };
+        let Some(session) = self
+            .running_sessions
+            .iter_mut()
+            .find(|session| session.key == key)
+        else {
+            return;
+        };
+
+        let rows = height.max(1);
+        let cols = width.max(1);
+        let _ = session.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        if let Ok(mut parser) = session.parser.lock() {
+            parser.screen_mut().set_size(rows, cols);
+        }
     }
 
     pub fn project_metadata(&self) -> Option<&ProjectMetadataSummary> {
@@ -429,11 +494,19 @@ impl App {
                 self.pending_g = false;
                 self.clear_all_filters()
             }
-            KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Char('q') if self.focus == Focus::RunningTargets => {
+                self.close_selected_running_target()?
+            }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('a') if self.focus == Focus::Projects => self.start_create_project(),
-            KeyCode::Char('b') => self.toggle_selected_project_bookmark(),
-            KeyCode::Char('c') if self.focus == Focus::Projects => self.clean_selected_project(),
+            KeyCode::Char('b') if key_event.modifiers.is_empty() => {
+                self.toggle_selected_project_bookmark()
+            }
+            KeyCode::Char('c')
+                if self.focus == Focus::Projects && key_event.modifiers.is_empty() =>
+            {
+                self.clean_selected_project()
+            }
             KeyCode::Char('d') if self.focus == Focus::Projects => {
                 if self.current_project().is_some() {
                     self.confirm_delete_project = true;
@@ -455,7 +528,7 @@ impl App {
                     };
                     self.refresh_targets();
                 }
-                Focus::CiRuns => {}
+                Focus::RunningTargets | Focus::CiRuns => {}
                 Focus::Targets => {
                     self.filter_mode = true;
                     self.target_cursor = if self.filtered_targets.is_empty() {
@@ -467,13 +540,29 @@ impl App {
             },
             KeyCode::Right | KeyCode::Char('l') => {
                 self.focus = match self.focus {
+                    Focus::CiRuns => {
+                        if self.running_target_statuses().next().is_some() {
+                            if self.running_cursor < 0 {
+                                self.running_cursor = 0;
+                            }
+                            Focus::RunningTargets
+                        } else {
+                            Focus::Projects
+                        }
+                    }
+                    Focus::RunningTargets => Focus::Projects,
                     Focus::Projects => Focus::Targets,
-                    Focus::CiRuns => Focus::Projects,
                     Focus::Targets => Focus::Targets,
                 };
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = match self.focus {
+                    Focus::Projects if self.running_target_statuses().next().is_some() => {
+                        if self.running_cursor < 0 {
+                            self.running_cursor = 0;
+                        }
+                        Focus::RunningTargets
+                    }
                     Focus::Projects if self.project_ci_runs().is_some() => {
                         if self.ci_cursor < 0 {
                             self.ci_cursor = 0;
@@ -481,27 +570,72 @@ impl App {
                         Focus::CiRuns
                     }
                     Focus::Projects => Focus::Projects,
+                    Focus::RunningTargets if self.project_ci_runs().is_some() => {
+                        if self.ci_cursor < 0 {
+                            self.ci_cursor = 0;
+                        }
+                        Focus::CiRuns
+                    }
+                    Focus::RunningTargets => Focus::RunningTargets,
                     Focus::CiRuns => Focus::CiRuns,
                     Focus::Targets => Focus::Projects,
                 };
             }
-            KeyCode::Char('j') | KeyCode::Down => match self.focus {
+            KeyCode::Char('J') | KeyCode::Down if self.focus == Focus::RunningTargets => {
+                if self.project_ci_runs().is_some() {
+                    if self.ci_cursor < 0 {
+                        self.ci_cursor = 0;
+                    }
+                    self.focus = Focus::CiRuns;
+                } else {
+                    self.select_next_running_target();
+                }
+            }
+            KeyCode::Char('K') | KeyCode::Up if self.focus == Focus::CiRuns => {
+                if self.running_target_statuses().next().is_some() {
+                    if self.running_cursor < 0 {
+                        self.running_cursor = 0;
+                    }
+                    self.focus = Focus::RunningTargets;
+                } else {
+                    self.select_previous_ci_run();
+                }
+            }
+            KeyCode::Char('j') => match self.focus {
                 Focus::Projects => self.select_next_project(),
+                Focus::RunningTargets => self.select_next_running_target(),
                 Focus::CiRuns => self.select_next_ci_run(),
                 Focus::Targets => self.select_next_target(),
             },
-            KeyCode::Char('k') | KeyCode::Up => match self.focus {
+            KeyCode::Char('k') => match self.focus {
                 Focus::Projects => self.select_previous_project(),
+                Focus::RunningTargets => self.select_previous_running_target(),
+                Focus::CiRuns => self.select_previous_ci_run(),
+                Focus::Targets => self.select_previous_target(),
+            },
+            KeyCode::Down => match self.focus {
+                Focus::Projects => self.select_next_project(),
+                Focus::RunningTargets => self.select_next_running_target(),
+                Focus::CiRuns => self.select_next_ci_run(),
+                Focus::Targets => self.select_next_target(),
+            },
+            KeyCode::Up => match self.focus {
+                Focus::Projects => self.select_previous_project(),
+                Focus::RunningTargets => self.select_previous_running_target(),
                 Focus::CiRuns => self.select_previous_ci_run(),
                 Focus::Targets => self.select_previous_target(),
             },
             KeyCode::Enter => match self.focus {
                 Focus::Projects => self.open_selected_project()?,
+                Focus::RunningTargets => self.rerun_selected_running_target()?,
                 Focus::CiRuns => self.open_selected_ci_run()?,
                 Focus::Targets => self.run_selected_target()?,
             },
             KeyCode::Char('e') if self.focus == Focus::Targets => self.edit_selected_target()?,
             _ => {}
+        }
+        if self.focus == Focus::RunningTargets {
+            self.sync_project_selection_to_running_target();
         }
         Ok(())
     }
@@ -512,6 +646,13 @@ impl App {
         self.spinner_last_tick = now;
         self.spinner_state.tick(dt);
         self.refresh_target_status();
+        if self.focus == Focus::RunningTargets && self.running_target_statuses().next().is_none() {
+            self.focus = if self.project_ci_runs().is_some() {
+                Focus::CiRuns
+            } else {
+                Focus::Projects
+            };
+        }
 
         let project_status = self.project_matcher.tick(0);
         if project_status.changed {
@@ -567,6 +708,13 @@ impl App {
                 };
                 self.refresh_targets();
             }
+            Focus::RunningTargets => {
+                self.running_cursor = if self.running_target_statuses().next().is_none() {
+                    -1
+                } else {
+                    0
+                };
+            }
             Focus::CiRuns => {
                 self.ci_cursor = if self.filtered_ci_runs.is_empty() {
                     -1
@@ -593,6 +741,10 @@ impl App {
                     self.filtered_projects.len() as isize - 1
                 };
                 self.refresh_targets();
+            }
+            Focus::RunningTargets => {
+                let len = self.running_target_statuses().count();
+                self.running_cursor = if len == 0 { -1 } else { len as isize - 1 };
             }
             Focus::CiRuns => {
                 self.ci_cursor = if self.filtered_ci_runs.is_empty() {
@@ -624,6 +776,21 @@ impl App {
         self.refresh_targets();
     }
 
+    pub fn select_next_running_target(&mut self) {
+        let len = self.running_target_statuses().count();
+        if len == 0 {
+            self.running_cursor = -1;
+            return;
+        }
+
+        self.running_cursor = if self.running_cursor < 0 {
+            0
+        } else {
+            (self.running_cursor + 1) % len as isize
+        };
+        self.sync_project_selection_to_running_target();
+    }
+
     pub fn select_next_ci_run(&mut self) {
         if self.filtered_ci_runs.is_empty() {
             self.ci_cursor = -1;
@@ -649,6 +816,21 @@ impl App {
         };
     }
 
+    pub fn select_previous_running_target(&mut self) {
+        let len = self.running_target_statuses().count();
+        if len == 0 {
+            self.running_cursor = -1;
+            return;
+        }
+
+        self.running_cursor = if self.running_cursor < 0 {
+            len as isize - 1
+        } else {
+            (self.running_cursor - 1).rem_euclid(len as isize)
+        };
+        self.sync_project_selection_to_running_target();
+    }
+
     pub fn select_previous_ci_run(&mut self) {
         if self.filtered_ci_runs.is_empty() {
             self.ci_cursor = -1;
@@ -672,6 +854,76 @@ impl App {
         } else {
             (self.target_cursor - 1).rem_euclid(self.filtered_targets.len() as isize)
         };
+    }
+
+    pub fn rerun_selected_running_target(&mut self) -> color_eyre::Result<()> {
+        let Some(status) = self.current_running_target_status().cloned() else {
+            return Ok(());
+        };
+
+        self.close_selected_running_target()?;
+
+        let target = self
+            .target_cache
+            .get(&status.project_path)
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|target| {
+                        target.name == status.target_name && target.kind == status.target_kind
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                let targets = discover_targets(&status.project_path);
+                let target = targets.iter().find(|target| {
+                    target.name == status.target_name && target.kind == status.target_kind
+                })?;
+                Some(target.clone())
+            });
+
+        let Some(target) = target else {
+            return Ok(());
+        };
+
+        self.start_target_run(status.project_name, status.project_path, target, false)
+    }
+
+    pub fn close_selected_running_target(&mut self) -> color_eyre::Result<()> {
+        let Some(key) = self
+            .current_running_target_status()
+            .map(|status| status.key.clone())
+        else {
+            return Ok(());
+        };
+
+        if let Some(session) = self
+            .running_sessions
+            .iter_mut()
+            .find(|session| session.key == key)
+        {
+            let _ = session.child.kill();
+        }
+
+        self.running_sessions.retain(|session| session.key != key);
+        self.target_statuses.retain(|status| status.key != key);
+
+        let running_count = self.running_target_statuses().count() as isize;
+        self.running_cursor = if running_count == 0 {
+            -1
+        } else {
+            self.running_cursor.clamp(0, running_count - 1)
+        };
+
+        if running_count == 0 && self.focus == Focus::RunningTargets {
+            self.focus = if self.project_ci_runs().is_some() {
+                Focus::CiRuns
+            } else {
+                Focus::Projects
+            };
+        }
+
+        Ok(())
     }
 
     pub fn open_selected_ci_run(&mut self) -> color_eyre::Result<()> {
@@ -716,54 +968,142 @@ impl App {
         let Some(project) = self.current_project() else {
             return Ok(());
         };
-        let Some(target) = self.current_target() else {
+        let Some(target) = self.current_target().cloned() else {
             return Ok(());
         };
 
-        let project_name = project.name.clone();
-        let project_path = project.path.clone();
+        self.start_target_run(project.name.clone(), project.path.clone(), target, true)
+    }
+
+    fn start_target_run(
+        &mut self,
+        project_name: String,
+        project_path: PathBuf,
+        target: Target,
+        reuse_existing: bool,
+    ) -> color_eyre::Result<()> {
         let target_name = target.name.clone();
         let target_kind = target.kind.clone();
-        let (status_path, log_path, pid_path) =
-            target_runtime_paths(&project_path, &target_kind, &target_name);
-        if let Some(parent) = status_path.parent() {
-            fs::create_dir_all(parent)?;
+        let key = target_runtime_key(&project_path, &target_kind, &target_name);
+
+        if reuse_existing {
+            if let Some(index) = self.target_statuses.iter().position(|status| {
+                status.project_path == project_path
+                    && status.target_name == target_name
+                    && status.target_kind == target_kind
+                    && matches!(
+                        status.kind,
+                        TargetStatusKind::Building
+                            | TargetStatusKind::Running
+                            | TargetStatusKind::Failed
+                    )
+            }) {
+                self.running_cursor = self
+                    .target_statuses
+                    .iter()
+                    .take(index + 1)
+                    .filter(|status| {
+                        matches!(
+                            status.kind,
+                            TargetStatusKind::Building
+                                | TargetStatusKind::Running
+                                | TargetStatusKind::Failed
+                        )
+                    })
+                    .count() as isize
+                    - 1;
+                self.focus = Focus::RunningTargets;
+                return Ok(());
+            }
         }
 
+        let package_flag = format!(" -p {}", shell_escape_arg(&target.package_name));
+        let feature_flags = if target.required_features.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " --features {}",
+                shell_escape_arg(&target.required_features.join(","))
+            )
+        };
+
         let run_command = match target_kind.as_str() {
-            "bin" => format!("cargo run --bin {}", shell_escape_arg(&target_name)),
-            "example" => format!("cargo run --example {}", shell_escape_arg(&target_name)),
-            "test" => format!("cargo test --test {}", shell_escape_arg(&target_name)),
-            "bench" => format!("cargo bench --bench {}", shell_escape_arg(&target_name)),
+            "bin" => format!(
+                "cargo --color always run{} --bin {}{}",
+                package_flag,
+                shell_escape_arg(&target_name),
+                feature_flags
+            ),
+            "example" => format!(
+                "cargo --color always run{} --example {}{}",
+                package_flag,
+                shell_escape_arg(&target_name),
+                feature_flags
+            ),
+            "test" => format!(
+                "cargo --color always test{} --test {}{}",
+                package_flag,
+                shell_escape_arg(&target_name),
+                feature_flags
+            ),
+            "bench" => format!(
+                "cargo --color always bench{} --bench {}{}",
+                package_flag,
+                shell_escape_arg(&target_name),
+                feature_flags
+            ),
             _ => return Ok(()),
         };
 
-        let pane_command = format!(
-            "echo $$ > {pid}; echo building > {status}; {run} 2>&1 | tee {log}; rc=$?; echo done > {status}; exit $rc",
-            pid = shell_escape_path(&pid_path),
-            status = shell_escape_path(&status_path),
-            log = shell_escape_path(&log_path),
-            run = run_command,
-        );
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 120, 10_000)));
+        let mut cmd = PtyCommandBuilder::new("bash");
+        cmd.cwd(&project_path);
+        cmd.arg("-lc");
+        cmd.arg(&run_command);
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+        let pid = child.process_id();
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+        let parser_for_thread = Arc::clone(&parser);
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut parser) = parser_for_thread.lock() {
+                            parser.process(&buffer[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
-        let command = format!(
-            "zellij action new-pane -f --close-on-exit --height 40 --width 140 --cwd {} -- sh -lc {}",
-            shell_escape_path(&project_path),
-            shell_escape_arg(&pane_command),
-        );
-
-        Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        self.target_statuses.retain(|status| {
-            !(status.project_path == project_path
-                && status.target_name == target_name
-                && status.target_kind == target_kind)
+        self.running_sessions.push(RunningSession {
+            key: key.clone(),
+            parser,
+            master: pair.master,
+            writer,
+            child,
         });
         self.target_statuses.push(TargetStatus {
             kind: TargetStatusKind::Building,
@@ -771,14 +1111,15 @@ impl App {
             project_path: project_path.clone(),
             target_name: target_name.clone(),
             target_kind: target_kind.clone(),
+            key,
             profile: RunProfile::Debug,
-            status_path,
-            log_path,
-            pid_path,
-            pid: None,
+            pid,
             started_at: Some(Instant::now()),
-            stats: ProcessStats::default(),
+            stats: read_process_stats(pid),
         });
+        self.running_cursor = self.running_target_statuses().count() as isize - 1;
+        self.focus = Focus::RunningTargets;
+        self.sync_project_selection_to_running_target();
         self.mark_project_opened(&project_path);
         Ok(())
     }
@@ -793,7 +1134,7 @@ impl App {
 
         let target_path = project.path.join(&target.path);
         let command = format!(
-            "zellij action new-pane -f --close-on-exit --height 40 --width 140 --cwd {} -- hx {}",
+            "zellij action new-pane -f --close-on-exit --height 50 --width 140 --cwd {} -- hx {}",
             shell_escape_path(&project.path),
             shell_escape_path(&target_path),
         );
@@ -1150,9 +1491,32 @@ impl App {
         }
     }
 
+    fn sync_project_selection_to_running_target(&mut self) {
+        let Some(status) = self.current_running_target_status().cloned() else {
+            return;
+        };
+
+        if let Some(index) = self.filtered_projects.iter().position(|&project_index| {
+            self.projects
+                .get(project_index)
+                .is_some_and(|project| project.path == status.project_path)
+        }) {
+            self.cursor = index as isize;
+            self.refresh_targets();
+            if let Some(target_index) = self.filtered_targets.iter().position(|&target_index| {
+                self.targets.get(target_index).is_some_and(|target| {
+                    target.name == status.target_name && target.kind == status.target_kind
+                })
+            }) {
+                self.target_cursor = target_index as isize;
+            }
+        }
+    }
+
     fn active_filter_is_non_empty(&self) -> bool {
         match self.focus {
             Focus::Projects => !self.project_query.is_empty(),
+            Focus::RunningTargets => false,
             Focus::CiRuns => !self.ci_query.is_empty(),
             Focus::Targets => !self.target_query.is_empty(),
         }
@@ -1165,6 +1529,7 @@ impl App {
                 self.project_query = self.project_input.value().to_string();
                 self.update_project_filter();
             }
+            Focus::RunningTargets => {}
             Focus::CiRuns => {
                 self.ci_input.handle(request);
                 self.ci_query = self.ci_input.value().to_string();
@@ -1188,6 +1553,13 @@ impl App {
                     0
                 };
                 self.refresh_targets();
+            }
+            Focus::RunningTargets => {
+                self.running_cursor = if self.running_target_statuses().next().is_none() {
+                    -1
+                } else {
+                    0
+                };
             }
             Focus::CiRuns => {
                 self.ci_cursor = if self.filtered_ci_runs.is_empty() {
@@ -1266,39 +1638,54 @@ impl App {
     }
 
     fn refresh_target_status(&mut self) {
-        for status in &mut self.target_statuses {
-            if let Ok(contents) = fs::read_to_string(&status.status_path) {
-                match contents.trim() {
-                    "building" => status.kind = TargetStatusKind::Building,
-                    "running" => {
-                        if status.kind != TargetStatusKind::Running {
-                            status.kind = TargetStatusKind::Running;
-                            status.started_at = Some(Instant::now());
-                        }
-                    }
-                    "done" => {
-                        status.kind = TargetStatusKind::Running;
-                        status.started_at.get_or_insert_with(Instant::now);
-                        status.pid = None;
-                    }
-                    _ => {}
+        let mut finished = HashSet::new();
+
+        for session in &mut self.running_sessions {
+            if let Ok(Some(exit_status)) = session.child.try_wait() {
+                if exit_status.success() {
+                    finished.insert(session.key.clone());
+                } else if let Some(status) = self
+                    .target_statuses
+                    .iter_mut()
+                    .find(|status| status.key == session.key)
+                {
+                    status.kind = TargetStatusKind::Failed;
+                    status.pid = None;
+                    status.stats = ProcessStats::default();
                 }
             }
+        }
 
-            if status.pid.is_none() {
-                status.pid = fs::read_to_string(&status.pid_path)
-                    .ok()
-                    .and_then(|contents| contents.trim().parse::<u32>().ok());
+        for status in &mut self.target_statuses {
+            if finished.contains(&status.key) || status.kind == TargetStatusKind::Failed {
+                continue;
             }
-
+            if status
+                .started_at
+                .is_some_and(|started_at| started_at.elapsed().as_millis() > 750)
+            {
+                status.kind = TargetStatusKind::Running;
+            }
+            status.pid = self
+                .running_sessions
+                .iter()
+                .find(|session| session.key == status.key)
+                .and_then(|session| session.child.process_id())
+                .or(status.pid);
             status.stats = read_process_stats(status.pid);
         }
 
-        self.target_statuses.retain(|status| {
-            fs::read_to_string(&status.status_path)
-                .map(|contents| contents.trim() != "done")
-                .unwrap_or(true)
-        });
+        self.running_sessions
+            .retain(|session| !finished.contains(&session.key));
+        self.target_statuses
+            .retain(|status| !finished.contains(&status.key));
+
+        let running_count = self.running_target_statuses().count() as isize;
+        self.running_cursor = if running_count == 0 {
+            -1
+        } else {
+            self.running_cursor.clamp(0, running_count - 1)
+        };
     }
 
     fn start_create_project(&mut self) {
@@ -1504,8 +1891,16 @@ impl App {
         self.loading_git_statuses.remove(&project_path);
         self.loading_sizes.remove(&project_path);
         self.loading_targets.remove(&project_path);
+        let removed_keys: HashSet<String> = self
+            .target_statuses
+            .iter()
+            .filter(|status| status.project_path == project_path)
+            .map(|status| status.key.clone())
+            .collect();
         self.target_statuses
             .retain(|status| status.project_path != project_path);
+        self.running_sessions
+            .retain(|session| !removed_keys.contains(&session.key));
 
         self.confirm_delete_project = false;
         self.rebuild_project_matcher();
@@ -1605,6 +2000,12 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        self.running_cursor = if self.running_target_statuses().next().is_none() {
+            -1
+        } else {
+            self.running_cursor
+                .clamp(0, self.running_target_statuses().count() as isize - 1)
+        };
         self.ci_cursor = if self.filtered_ci_runs.is_empty() {
             -1
         } else {
@@ -1727,23 +2128,13 @@ fn save_recent_projects(recent_projects: &RecentProjects) -> std::io::Result<()>
     fs::write(path, content)
 }
 
-fn target_runtime_paths(
-    project_path: &Path,
-    target_kind: &str,
-    target_name: &str,
-) -> (PathBuf, PathBuf, PathBuf) {
-    let key = sanitize_runtime_key(&format!(
+fn target_runtime_key(project_path: &Path, target_kind: &str, target_name: &str) -> String {
+    sanitize_runtime_key(&format!(
         "{}__{}__{}",
         project_path.display(),
         target_kind,
         target_name
-    ));
-    let dir = dashboard_state_dir().join("targets");
-    (
-        dir.join(format!("{key}.status")),
-        dir.join(format!("{key}.log")),
-        dir.join(format!("{key}.pid")),
-    )
+    ))
 }
 
 fn sanitize_runtime_key(value: &str) -> String {
@@ -2211,6 +2602,7 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
                 load_target_descriptions(package.manifest_path.as_std_path());
             package.targets.iter().filter_map(move |target| {
                 select_target_kind(target).map(|kind| Target {
+                    package_name: package.name.to_string(),
                     kind: kind.to_string(),
                     name: target.name.clone(),
                     path: target
@@ -2222,6 +2614,7 @@ fn discover_targets(project_path: &Path) -> Vec<Target> {
                         .get(&(kind.to_string(), target.name.clone()))
                         .cloned()
                         .flatten(),
+                    required_features: target.required_features.clone(),
                 })
             })
         })
