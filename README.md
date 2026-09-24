@@ -1,6 +1,6 @@
 # dashboard
 
-![Demo](assets/demo.gif)
+![demo](docs/demo.gif)
 
 Terminal dashboard for browsing local Rust projects, opening them in Zellij, and launching Cargo targets.
 

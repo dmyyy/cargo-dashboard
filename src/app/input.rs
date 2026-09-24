@@ -231,6 +231,7 @@ impl App {
                 Some(InputRequest::DeletePrevWord)
             }
             KeyCode::Backspace => Some(InputRequest::DeletePrevChar),
+            KeyCode::Left => Some(InputRequest::GoToPrevChar),
             KeyCode::Right => Some(InputRequest::GoToNextChar),
             KeyCode::Home => Some(InputRequest::GoToStart),
             KeyCode::End => Some(InputRequest::GoToEnd),
