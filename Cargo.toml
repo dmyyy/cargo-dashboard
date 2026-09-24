@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tui-input = "0.15"
-sysinfo = "0.37"
+sysinfo = "0.39"
 unicode-width = "0.2"
 toml = "0.9"
 portable-pty = "0.9"
