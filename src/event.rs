@@ -57,6 +57,12 @@ impl EventHandler {
         Self { sender, receiver }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Self { sender, receiver }
+    }
+
     /// Receives an event from the sender.
     ///
     /// This function blocks until an event is received.

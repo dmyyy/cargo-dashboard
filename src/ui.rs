@@ -1,3 +1,9 @@
+mod details;
+mod dialogs;
+mod format;
+mod projects;
+mod running;
+mod widgets;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
@@ -12,12 +18,41 @@ use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, CiRun, Focus, RunProfile, TargetStatusKind};
+use dialogs::{
+    render_create_project_dialog, render_create_project_pending_dialog, render_delete_dialog,
+    render_help_dialog,
+};
+use format::{
+    format_ci_time, format_count, format_duration, format_size, language_label_text, truncate,
+};
+use running::{render_running, render_running_terminal};
+use widgets::{
+    centered_rect, ci_scroll_offset, project_scroll_offset, render_search_input,
+    target_scroll_offset,
+};
 
+use details::{render_ci_runs, render_languages, render_metadata};
+use projects::{render_projects, render_targets};
 const INACTIVE_COLOR: Color = Color::Indexed(0);
-const ACTIVE_COLOR: Color = Color::Indexed(201);
+const ACTIVE_COLOR: Color = Color::Magenta;
 const ACTIVE_TEXT_COLOR: Color = Color::Indexed(7);
 const INACTIVE_TEXT_COLOR: Color = Color::Indexed(8);
-const SELECTED_TEXT_COLOR: Color = Color::Indexed(0);
+const CURSOR_COLOR: Color = Color::Indexed(0);
+const SELECTED_TEXT_COLOR: Color = Color::Indexed(7);
+
+pub(super) fn pane_border_style(focused: bool) -> Style {
+    let style = Style::default().fg(if focused {
+        ACTIVE_COLOR
+    } else {
+        INACTIVE_COLOR
+    });
+
+    if focused {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let columns = Layout::horizontal([
@@ -74,8 +109,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let show_project_search = !show_terminal
         && (!app.project_query.is_empty() || (app.focus == Focus::Projects && app.filter_mode));
     let middle_chunks = Layout::vertical([
-        Constraint::Min(0),
         Constraint::Length(if show_project_search { 3 } else { 0 }),
+        Constraint::Min(0),
     ])
     .split(middle);
     if show_terminal {
@@ -87,12 +122,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         };
         render_running_terminal(frame, app, terminal_area);
     } else {
-        render_projects(frame, app, middle_chunks[0]);
+        render_projects(frame, app, middle_chunks[1]);
     }
     if show_project_search {
         render_search_input(
             frame,
-            middle_chunks[1],
+            middle_chunks[0],
             &app.project_input,
             app.filter_mode,
             "Search projects",
@@ -103,15 +138,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let show_target_search =
             !app.target_query.is_empty() || (app.focus == Focus::Targets && app.filter_mode);
         let right_chunks = Layout::vertical([
-            Constraint::Min(0),
             Constraint::Length(if show_target_search { 3 } else { 0 }),
+            Constraint::Min(0),
         ])
         .split(right);
-        render_targets(frame, app, right_chunks[0]);
+        render_targets(frame, app, right_chunks[1]);
         if show_target_search {
             render_search_input(
                 frame,
-                right_chunks[1],
+                right_chunks[0],
                 &app.target_input,
                 app.filter_mode,
                 "Search targets",
@@ -130,785 +165,25 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.creating_project_in_background {
         render_create_project_pending_dialog(frame);
     }
-}
 
-fn render_metadata(frame: &mut Frame, app: &mut App, area: Rect) {
-    let (title, body) = if let Some(metadata) = app.project_metadata() {
-        let path = app
-            .current_project()
-            .map(|project| project.path.display().to_string())
-            .unwrap_or_else(|| "—".to_string());
-        let secondary_style = Style::default().fg(INACTIVE_TEXT_COLOR);
-        let mut body = vec![
-            Line::from(Span::styled(path, secondary_style)),
-            Line::default(),
-            Line::from(Span::styled(metadata.description.clone(), secondary_style)),
-        ];
-
-        if let Some(description) = app.current_target_description() {
-            body.push(Line::default());
-            body.push(Line::from(vec![
-                Span::styled("Target: ", Style::default().fg(ACTIVE_TEXT_COLOR)),
-                Span::styled(description.to_string(), secondary_style),
-            ]));
-        }
-
-        (
-            format!(
-                "{}{}{}",
-                metadata.package_name,
-                if metadata.package_version == "—" {
-                    String::new()
-                } else {
-                    format!(" v{}", metadata.package_version)
-                },
-                if metadata.git_branch == "—" {
-                    String::new()
-                } else {
-                    format!("  {}", metadata.git_branch)
-                }
-            ),
-            body,
-        )
-    } else {
-        (
-            "Metadata".to_string(),
-            vec![Line::from("No project selected")],
-        )
-    };
-
-    frame.render_widget(
-        Paragraph::new(body)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::bordered()
-                    .title(
-                        Line::from(title).style(
-                            Style::default()
-                                .fg(ACTIVE_TEXT_COLOR)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    )
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .fg(INACTIVE_COLOR),
-        area,
-    );
-}
-
-fn render_projects(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let visible_rows = inner.height.saturating_sub(1) as usize;
-    let scroll_offset = project_scroll_offset(app, visible_rows);
-
-    if app.filtered_projects.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No matching projects")
-                .block(
-                    Block::bordered()
-                        .title("Projects")
-                        .title_alignment(Alignment::Center)
-                        .border_type(BorderType::Rounded),
-                )
-                .fg(if app.focus == Focus::Projects {
-                    ACTIVE_COLOR
-                } else {
-                    INACTIVE_COLOR
-                }),
-            area,
-        );
-    } else {
-        let visible_projects: Vec<_> = app
-            .visible_projects()
-            .enumerate()
-            .skip(scroll_offset)
-            .take(visible_rows)
-            .map(|(index, project)| (index, project.clone()))
-            .collect();
-
-        let rows: Vec<Row> = visible_projects
-            .into_iter()
-            .map(|(index, project)| {
-                let is_selected = app.cursor == index as isize;
-                let base_style = if is_selected {
-                    Style::default()
-                        .fg(SELECTED_TEXT_COLOR)
-                        .bg(ACTIVE_COLOR)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(if app.focus == Focus::Projects {
-                        ACTIVE_TEXT_COLOR
-                    } else {
-                        INACTIVE_TEXT_COLOR
-                    })
-                };
-                let name_style = if is_selected {
-                    base_style
-                } else if app.focus == Focus::Projects {
-                    base_style.fg(ACTIVE_TEXT_COLOR)
-                } else {
-                    base_style.fg(INACTIVE_TEXT_COLOR)
-                };
-                let cached_size = app.cached_project_size_bytes(&project);
-                let size_text = cached_size
-                    .map(format_size)
-                    .unwrap_or_else(|| "…".to_string());
-                let size_style = if is_selected {
-                    base_style
-                } else if cached_size.is_some_and(|size| size >= 5 * 1024 * 1024 * 1024) {
-                    base_style.fg(Color::Indexed(9))
-                } else if cached_size.is_some_and(|size| size >= 1024 * 1024 * 1024) {
-                    base_style.fg(Color::Indexed(1))
-                } else {
-                    base_style
-                };
-
-                let last_opened = app.project_last_opened(&project);
-                let bookmark = if app.is_bookmarked(&project) {
-                    "🌟"
-                } else {
-                    ""
-                };
-                Row::new(vec![
-                    Cell::from(bookmark),
-                    Cell::from(project.name).style(name_style),
-                    Cell::from(size_text).style(size_style),
-                    Cell::from(last_opened),
-                ])
-                .style(base_style)
-            })
-            .collect();
-
-        frame.render_widget(
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(2),
-                    Constraint::Fill(1),
-                    Constraint::Length(10),
-                    Constraint::Length(12),
-                ],
-            )
-            .header(
-                Row::new(vec!["", "Name", "Size", "Last Opened"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            )
-            .block(
-                Block::bordered()
-                    .title("Projects")
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .fg(if app.focus == Focus::Projects {
-                ACTIVE_COLOR
-            } else {
-                INACTIVE_COLOR
-            }),
-            area,
-        );
-    }
-
-    if !app.filtered_projects.is_empty() {
-        let mut scrollbar_state =
-            ScrollbarState::new(app.filtered_projects.len()).position(scroll_offset);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+    if app.show_help {
+        render_help_dialog(frame);
     }
 }
 
-fn render_targets(frame: &mut Frame, app: &App, area: Rect) {
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let visible_rows = inner.height.saturating_sub(1) as usize;
-    let target_offset = target_scroll_offset(app, visible_rows);
+#[cfg(test)]
+mod format_tests {
+    use super::{language_label_text, truncate};
 
-    if app.targets_loading() {
-        frame.render_widget(
-            Paragraph::new("Loading targets…")
-                .block(
-                    Block::bordered()
-                        .title("Targets")
-                        .title_alignment(Alignment::Center)
-                        .border_type(BorderType::Rounded),
-                )
-                .fg(if app.focus == Focus::Targets {
-                    ACTIVE_COLOR
-                } else {
-                    INACTIVE_COLOR
-                }),
-            area,
-        );
-    } else if app.filtered_targets.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No matching targets")
-                .block(
-                    Block::bordered()
-                        .title("Targets")
-                        .title_alignment(Alignment::Center)
-                        .border_type(BorderType::Rounded),
-                )
-                .fg(if app.focus == Focus::Targets {
-                    ACTIVE_COLOR
-                } else {
-                    INACTIVE_COLOR
-                }),
-            area,
-        );
-    } else {
-        let visible_targets: Vec<_> = app
-            .visible_targets()
-            .enumerate()
-            .skip(target_offset)
-            .take(visible_rows)
-            .map(|(index, target)| (index, target.clone()))
-            .collect();
-
-        let rows: Vec<Row> = visible_targets
-            .into_iter()
-            .map(|(index, target)| {
-                let is_selected =
-                    app.focus == Focus::Targets && app.target_cursor == index as isize;
-                let style = if is_selected {
-                    Style::default()
-                        .fg(SELECTED_TEXT_COLOR)
-                        .bg(ACTIVE_COLOR)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(if app.focus == Focus::Targets {
-                        ACTIVE_TEXT_COLOR
-                    } else {
-                        INACTIVE_TEXT_COLOR
-                    })
-                };
-                let grouped_path = if index > 0
-                    && app
-                        .targets
-                        .get(index - 1)
-                        .is_some_and(|prev| prev.path == target.path)
-                {
-                    String::new()
-                } else {
-                    target.path.clone()
-                };
-                Row::new(vec![target.name.clone(), target.kind.clone(), grouped_path]).style(style)
-            })
-            .collect();
-
-        frame.render_widget(
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(20),
-                    Constraint::Length(10),
-                    Constraint::Fill(1),
-                ],
-            )
-            .header(
-                Row::new(vec!["Name", "Kind", "Path"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            )
-            .block(
-                Block::bordered()
-                    .title("Targets")
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .fg(if app.focus == Focus::Targets {
-                ACTIVE_COLOR
-            } else {
-                INACTIVE_COLOR
-            }),
-            area,
-        );
+    #[test]
+    fn refactor_format_language_padding() {
+        assert_eq!(language_label_text("CMake"), "△  CMake");
+        assert_eq!(language_label_text("Unknown"), "   Unknown");
     }
 
-    if !app.filtered_targets.is_empty() {
-        let mut scrollbar_state =
-            ScrollbarState::new(app.filtered_targets.len()).position(target_offset);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+    #[test]
+    fn refactor_format_unicode_truncation() {
+        assert_eq!(truncate("aé界z", 3), "aé…");
+        assert_eq!(truncate("aé界z", 4), "aé界z");
     }
-}
-
-fn render_delete_dialog(frame: &mut Frame, app: &App) {
-    let Some(project) = app.current_project() else {
-        return;
-    };
-
-    let area = centered_rect(frame.area(), 56, 3);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(format!("Delete {}? [y/n]", project.name))
-            .alignment(Alignment::Center)
-            .block(
-                Block::bordered()
-                    .title("Confirm Deletion")
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(Color::Red).bg(Color::Black)),
-        area,
-    );
-}
-
-fn render_create_project_dialog(frame: &mut Frame, app: &App) {
-    let area = centered_rect(frame.area(), 72, 3);
-    let width = area.width.saturating_sub(2) as usize;
-    let scroll = app.create_project_input.visual_scroll(width);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(app.create_project_input.value())
-            .alignment(Alignment::Left)
-            .scroll((0, scroll as u16))
-            .block(
-                Block::bordered()
-                    .title("Add Project: name OR git url")
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(Color::Green).bg(Color::Black)),
-        area,
-    );
-
-    let cursor = app.create_project_input.visual_cursor().max(scroll) - scroll + 1;
-    frame.set_cursor_position((area.x + cursor as u16, area.y + 1));
-}
-
-fn render_create_project_pending_dialog(frame: &mut Frame) {
-    let area = centered_rect(frame.area(), 40, 5);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new("Creating project…")
-            .alignment(Alignment::Center)
-            .block(
-                Block::bordered()
-                    .title("Please wait")
-                    .title_alignment(Alignment::Center)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
-        area,
-    );
-}
-
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let [area] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
-        .flex(Flex::Center)
-        .areas(area);
-    area
-}
-
-fn render_search_input(
-    frame: &mut Frame,
-    area: Rect,
-    input: &tui_input::Input,
-    editing: bool,
-    _title: &str,
-) {
-    let width = area.width.max(3) - 3;
-    let scroll = input.visual_scroll(width as usize);
-    let widget = Paragraph::new(input.value())
-        .style(Style::default().fg(Color::Green))
-        .scroll((0, scroll as u16))
-        .block(
-            Block::bordered()
-                .title("Search")
-                .border_type(BorderType::Rounded),
-        );
-    frame.render_widget(widget, area);
-
-    if editing {
-        let x = input.visual_cursor().max(scroll) - scroll + 1;
-        frame.set_cursor_position((area.x + x as u16, area.y + 1));
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes == 0 {
-        return "0 B".to_string();
-    }
-    format!("{:.1} GiB", bytes as f64 / GIB)
-}
-
-fn render_running(frame: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Row> = app
-        .running_target_statuses()
-        .enumerate()
-        .map(|(index, status)| {
-            let is_selected =
-                app.focus == Focus::RunningTargets && app.running_cursor == index as isize;
-            let row_style = if is_selected {
-                Style::default()
-                    .fg(SELECTED_TEXT_COLOR)
-                    .bg(ACTIVE_COLOR)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(if app.focus == Focus::RunningTargets {
-                    ACTIVE_TEXT_COLOR
-                } else {
-                    INACTIVE_TEXT_COLOR
-                })
-            };
-            let indicator = match status.kind {
-                TargetStatusKind::Failed => {
-                    Cell::from(Line::from(Span::styled("✗", row_style.fg(Color::Red))))
-                }
-                TargetStatusKind::Building | TargetStatusKind::Running => {
-                    Cell::from(spinner_frame(app))
-                }
-            };
-            Row::new(vec![
-                indicator,
-                Cell::from(format!("{}/{}", status.project_name, status.target_name)),
-                Cell::from(match status.profile {
-                    RunProfile::Debug => "debug".to_string(),
-                    RunProfile::Release => "release".to_string(),
-                }),
-                Cell::from(format_duration(status.started_at.map(|started_at| started_at.elapsed()))),
-            ])
-            .style(row_style)
-        })
-        .collect();
-
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Fill(1),
-                Constraint::Length(8),
-                Constraint::Length(8),
-            ],
-        )
-        .header(
-            Row::new(vec!["", "Target", "Profile", "Uptime"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(
-            Block::bordered()
-                .title("Running")
-                .title_alignment(Alignment::Center)
-                .border_type(BorderType::Rounded),
-        )
-        .fg(if app.focus == Focus::RunningTargets {
-            ACTIVE_COLOR
-        } else {
-            INACTIVE_COLOR
-        }),
-        area,
-    );
-}
-
-fn render_running_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    app.resize_selected_running_terminal(inner.width, inner.height);
-
-    let block = Block::bordered()
-        .title("Terminal")
-        .title_alignment(Alignment::Center)
-        .border_type(BorderType::Rounded);
-
-    if let Some(parser) = app.selected_running_terminal_parser()
-        && let Ok(parser) = parser.lock()
-    {
-        frame.render_widget(PseudoTerminal::new(parser.screen()).block(block), area);
-    } else {
-        frame.render_widget(
-            Paragraph::new("No running target selected").block(block),
-            area,
-        );
-    }
-}
-
-fn spinner_frame(app: &App) -> String {
-    app.spinner_state.frame_str().to_string()
-}
-
-fn format_duration(duration: Option<std::time::Duration>) -> String {
-    let Some(duration) = duration else {
-        return "—".to_string();
-    };
-    let secs = duration.as_secs();
-    format!("{:02}:{:02}", secs / 60, secs % 60)
-}
-
-fn render_languages(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(languages) = app.project_languages() else {
-        return;
-    };
-
-    let rows: Vec<Row> = languages
-        .languages
-        .iter()
-        .take(area.height.saturating_sub(3) as usize)
-        .map(|language| {
-            Row::new(vec![
-                Cell::from(language_label_text(&language.name)).style(
-                    Style::default()
-                        .fg(ACTIVE_TEXT_COLOR)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(format_count(language.code)),
-                Cell::from(format_count(language.comments)),
-                Cell::from(format_count(language.blanks)),
-            ])
-            .style(Style::default().fg(INACTIVE_TEXT_COLOR))
-        })
-        .collect();
-
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Fill(1),
-                Constraint::Length(6),
-                Constraint::Length(8),
-                Constraint::Length(6),
-            ],
-        )
-        .header(
-            Row::new(vec!["Language", "Code", "Comments", "Blank"]).style(
-                Style::default()
-                    .fg(ACTIVE_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
-        .block(
-            Block::bordered()
-                .title("Languages")
-                .title_alignment(Alignment::Center)
-                .border_type(BorderType::Rounded),
-        )
-        .fg(INACTIVE_COLOR),
-        area,
-    );
-}
-
-fn render_ci_runs(frame: &mut Frame, app: &App, area: Rect) {
-    if app.project_ci_runs().is_none() {
-        return;
-    }
-
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let visible_rows = inner.height.saturating_sub(1) as usize;
-    let scroll_offset = ci_scroll_offset(app, visible_rows);
-
-    let rows: Vec<Row> = app
-        .visible_ci_runs()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_rows)
-        .map(|(index, run)| ci_run_row(app, index, run))
-        .collect();
-
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(3),
-                Constraint::Length(10),
-                Constraint::Fill(1),
-                Constraint::Length(16),
-            ],
-        )
-        .header(
-            Row::new(vec!["", "Branch", "Commit", "Timestamp"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(
-            Block::bordered()
-                .title("CI")
-                .title_alignment(Alignment::Center)
-                .border_type(BorderType::Rounded),
-        )
-        .fg(if app.focus == Focus::CiRuns {
-            ACTIVE_COLOR
-        } else {
-            INACTIVE_COLOR
-        }),
-        area,
-    );
-
-    let mut scrollbar_state =
-        ScrollbarState::new(app.filtered_ci_runs.len()).position(scroll_offset);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        area.inner(Margin {
-            vertical: 1,
-            horizontal: 0,
-        }),
-        &mut scrollbar_state,
-    );
-}
-
-fn ci_run_row(app: &App, index: usize, run: &CiRun) -> Row<'static> {
-    let is_selected = app.focus == Focus::CiRuns && app.ci_cursor == index as isize;
-    let row_style = if is_selected {
-        Style::default()
-            .fg(SELECTED_TEXT_COLOR)
-            .bg(ACTIVE_COLOR)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(if app.focus == Focus::CiRuns {
-            ACTIVE_TEXT_COLOR
-        } else {
-            INACTIVE_TEXT_COLOR
-        })
-    };
-    let status = match run.status.as_str() {
-        "success" => Span::styled("✓", row_style.fg(Color::Green)),
-        "failure" => Span::styled("✗", row_style.fg(Color::Red)),
-        "cancelled" => Span::styled("○", row_style.fg(Color::Yellow)),
-        _ => Span::styled("…", row_style.fg(Color::Blue)),
-    };
-
-    Row::new(vec![
-        Cell::from(Line::from(status)),
-        Cell::from(truncate(&run.branch, 10)),
-        Cell::from(truncate(&run.title, 48)),
-        Cell::from(format_ci_time(&run.created_at)),
-    ])
-    .style(row_style)
-}
-
-fn language_label(language: &str) -> Line<'static> {
-    match language.to_ascii_lowercase().as_str() {
-        "rust" => language_label_parts("🦀", language, false),
-        "c" | "c header" => language_label_parts("", language, false),
-        "c++" | "c++ header" | "c++ module" => language_label_parts("", language, false),
-        "java" => language_label_parts("☕", language, false),
-        "go" => language_label_parts("", language, false),
-        "python" => language_label_parts("🐍", language, false),
-        "javascript" | "jsx" => language_label_parts("", language, false),
-        "typescript" | "tsx" => language_label_parts("", language, false),
-        "markdown" => language_label_parts("", language, false),
-        "shell" | "bash" | "zsh" | "fish" => language_label_parts("", language, false),
-        "liquid" => language_label_parts("💧", language, false),
-        "toml" => language_label_parts("⚙️", language, false),
-        "json" => language_label_parts("", language, false),
-        "html" => language_label_parts("🌐", language, false),
-        "plain text" => language_label_parts("📄", language, false),
-        "xml" => language_label_parts("󰗀", language, false),
-        "glsl" | "webgpu shader language" => language_label_parts("🔺", language, false),
-        "svg" => language_label_parts("📐", language, false),
-        "yaml" => language_label_parts("", language, false),
-        "bitbake" => language_label_parts("🍞", language, false),
-        "cmake" => language_label_parts("△", language, true),
-        "makefile" => language_label_parts("🛠️", language, false),
-        "autoconf" => language_label_parts("🔧", language, false),
-        "asciidoc" => language_label_parts("󱈙", language, false),
-        "batch" => language_label_parts("󰆍", language, false),
-        "rusty object notation" => language_label_parts("󰘦", language, false),
-        _ => language_label_parts("", language, false),
-    }
-}
-
-fn language_label_text(language: &str) -> String {
-    let line = language_label(language);
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-}
-
-fn language_label_parts(prefix: &str, language: &str, bright: bool) -> Line<'static> {
-    let prefix_style = if bright {
-        Style::default()
-            .fg(ACTIVE_TEXT_COLOR)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    let width = prefix.width();
-    let gap = " ".repeat((3usize.saturating_sub(width)).max(1));
-    Line::from(vec![
-        Span::styled(format!("{prefix}{gap}"), prefix_style),
-        Span::raw(language.to_string()),
-    ])
-}
-
-fn format_count(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    value
-        .chars()
-        .take(max.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
-fn format_ci_time(value: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|_| value.to_string())
-}
-
-fn ci_scroll_offset(app: &App, visible_rows: usize) -> usize {
-    scroll_offset(app.filtered_ci_runs.len(), app.ci_cursor, visible_rows)
-}
-
-fn project_scroll_offset(app: &App, visible_rows: usize) -> usize {
-    scroll_offset(app.filtered_projects.len(), app.cursor, visible_rows)
-}
-
-fn target_scroll_offset(app: &App, visible_rows: usize) -> usize {
-    scroll_offset(app.filtered_targets.len(), app.target_cursor, visible_rows)
-}
-
-fn scroll_offset(len: usize, cursor: isize, visible_rows: usize) -> usize {
-    if len == 0 || visible_rows == 0 || cursor < 0 {
-        return 0;
-    }
-
-    let max_offset = len.saturating_sub(visible_rows);
-    let cursor = usize::try_from(cursor).unwrap_or(0);
-    let center = visible_rows / 2;
-
-    cursor.saturating_sub(center).min(max_offset)
 }
